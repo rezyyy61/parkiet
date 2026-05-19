@@ -1,0 +1,212 @@
+import asyncio
+import queue
+import threading
+from typing import Any
+
+import numpy as np
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel
+
+from parkiet.dia.model import Dia, DEFAULT_SAMPLE_RATE
+
+MODEL: Dia | None = None
+GENERATION_LOCK = threading.Lock()
+
+VOICE_PRESETS = {
+    "s2_plain_t14": {
+        "speaker": "S2",
+        "temperature": 1.4,
+        "top_p": 0.95,
+        "cfg_scale": 3.0,
+        "cfg_filter_top_k": 45,
+    },
+    "s2_plain_t10": {
+        "speaker": "S2",
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "cfg_scale": 3.0,
+        "cfg_filter_top_k": 45,
+    },
+}
+
+
+class TtsRequest(BaseModel):
+    text: str
+    voice: str = "s2_plain_t14"
+
+
+app = FastAPI()
+
+
+def normalize_text(text: str, speaker: str) -> str:
+    text = text.strip()
+
+    for tag in ("[S1]", "[S2]"):
+        if text.startswith(tag):
+            text = text[len(tag):].strip()
+
+    return f"[{speaker}] {text}"
+
+
+def float_audio_to_pcm16_bytes(audio: np.ndarray) -> bytes:
+    audio = np.asarray(audio, dtype=np.float32)
+    audio = np.clip(audio, -1.0, 1.0)
+    pcm16 = (audio * 32767.0).astype("<i2")
+    return pcm16.tobytes()
+
+
+@app.on_event("startup")
+def startup() -> None:
+    global MODEL
+
+    print("loading Parkiet model...")
+
+    MODEL = Dia.from_local(
+        config_path="config.json",
+        checkpoint_path="weights/dia-nl-v1.pth",
+        compute_dtype="bfloat16",
+    )
+
+    print("warming up torch.compile...")
+
+    MODEL.generate(
+        "[S2] Dit is een korte test.",
+        cfg_scale=3.0,
+        temperature=1.4,
+        top_p=0.95,
+        cfg_filter_top_k=45,
+        use_torch_compile=False,
+        verbose=True,
+    )
+
+    print("Parkiet realtime TTS server ready")
+
+
+@app.get("/health")
+def health() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "model_loaded": MODEL is not None,
+        "voice": "s2_plain_t14",
+        "sample_rate": DEFAULT_SAMPLE_RATE,
+        "format": "pcm_s16le",
+        "channels": 1,
+    }
+
+
+@app.websocket("/ws/tts")
+async def ws_tts(websocket: WebSocket) -> None:
+    await websocket.accept()
+
+    if MODEL is None:
+        await websocket.send_json({"type": "error", "message": "model not loaded"})
+        await websocket.close()
+        return
+
+    try:
+        payload = await websocket.receive_json()
+        request = TtsRequest(**payload)
+
+        if request.voice not in VOICE_PRESETS:
+            await websocket.send_json(
+                {"type": "error", "message": f"unknown voice: {request.voice}"}
+            )
+            await websocket.close()
+            return
+
+        preset = VOICE_PRESETS[request.voice]
+        text = normalize_text(request.text, preset["speaker"])
+
+        chunks: queue.Queue[dict[str, Any] | None] = queue.Queue()
+
+        await websocket.send_json(
+            {
+                "type": "start",
+                "sample_rate": DEFAULT_SAMPLE_RATE,
+                "format": "pcm_s16le",
+                "channels": 1,
+                "voice": request.voice,
+            }
+        )
+
+        def on_chunk(
+            audio_chunk: np.ndarray,
+            sample_rate: int,
+            chunk_index: int,
+            is_final: bool,
+        ) -> None:
+            pcm_bytes = float_audio_to_pcm16_bytes(audio_chunk)
+
+            chunks.put(
+                {
+                    "index": chunk_index,
+                    "is_final": is_final,
+                    "sample_rate": sample_rate,
+                    "bytes": pcm_bytes,
+                }
+            )
+
+        def run_generation() -> None:
+            try:
+                print(
+                    f"Parkiet generation start voice={request.voice} text={text[:120]!r}",
+                    flush=True,
+                )
+
+                with GENERATION_LOCK:
+                    MODEL.generate(
+                        text,
+                        cfg_scale=preset["cfg_scale"],
+                        temperature=preset["temperature"],
+                        top_p=preset["top_p"],
+                        cfg_filter_top_k=preset["cfg_filter_top_k"],
+                        use_torch_compile=False,
+                        verbose=True,
+                        stream_callback=on_chunk,
+                        stream_probe_every_tokens=86,
+                    )
+
+                print("Parkiet generation done", flush=True)
+
+            except Exception as exc:
+                import traceback
+
+                print("Parkiet generation error:", repr(exc), flush=True)
+                traceback.print_exc()
+                chunks.put({"error": str(exc) or repr(exc)})
+            finally:
+                chunks.put(None)
+
+        thread = threading.Thread(target=run_generation, daemon=True)
+        thread.start()
+
+        while True:
+            item = await asyncio.to_thread(chunks.get)
+
+            if item is None:
+                await websocket.send_json({"type": "done"})
+                break
+
+            if "error" in item:
+                await websocket.send_json({"type": "error", "message": item["error"]})
+                break
+
+            await websocket.send_json(
+                {
+                    "type": "chunk",
+                    "index": item["index"],
+                    "is_final": item["is_final"],
+                    "sample_rate": item["sample_rate"],
+                    "format": "pcm_s16le",
+                    "channels": 1,
+                    "bytes": len(item["bytes"]),
+                }
+            )
+            await websocket.send_bytes(item["bytes"])
+
+    except WebSocketDisconnect:
+        return
+    except Exception as exc:
+        await websocket.send_json({"type": "error", "message": str(exc)})
+    finally:
+        await websocket.close()

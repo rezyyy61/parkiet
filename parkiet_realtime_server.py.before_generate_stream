@@ -1,0 +1,316 @@
+import asyncio
+import queue
+import threading
+from dataclasses import dataclass, field
+from typing import Any
+
+import numpy as np
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel
+
+from parkiet.dia.model import Dia, DEFAULT_SAMPLE_RATE
+
+
+VOICE_PRESETS = {
+    "s2_plain_t14": {
+        "speaker": "S2",
+        "temperature": 1.4,
+        "top_p": 0.95,
+        "cfg_scale": 3.0,
+        "cfg_filter_top_k": 45,
+    },
+    "s2_plain_t10": {
+        "speaker": "S2",
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "cfg_scale": 3.0,
+        "cfg_filter_top_k": 45,
+        "seed": 2202,
+    },
+    "s2_stable_t07": {
+        "speaker": "S2",
+        "temperature": 0.7,
+        "top_p": 0.85,
+        "cfg_scale": 3.0,
+        "cfg_filter_top_k": 35,
+        "seed": 2202,
+    },
+}
+
+
+class TtsRequest(BaseModel):
+    text: str
+    voice: str = "s2_plain_t10"
+
+
+@dataclass
+class GenerationJob:
+    text: str
+    voice: str
+    output_queue: queue.Queue[dict[str, Any] | None]
+    cancelled: threading.Event = field(default_factory=threading.Event)
+
+
+class ParkietWorker:
+    def __init__(self) -> None:
+        self.jobs: queue.Queue[GenerationJob] = queue.Queue()
+        self.ready = threading.Event()
+        self.failed: Exception | None = None
+        self.model: Dia | None = None
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def submit(self, job: GenerationJob) -> None:
+        self.jobs.put(job)
+
+    def _run(self) -> None:
+        try:
+            print("loading Parkiet model inside generation worker...", flush=True)
+
+            self.model = Dia.from_local(
+                config_path="config.json",
+                checkpoint_path="weights/dia-nl-v1.pth",
+                compute_dtype="bfloat16",
+            )
+
+            print("warming up torch.compile inside same worker thread...", flush=True)
+
+            self.model.generate(
+                "[S2] Dit is een korte test.",
+                cfg_scale=3.0,
+                temperature=1.0,
+                top_p=0.95,
+                cfg_filter_top_k=45,
+                use_torch_compile=True,
+                verbose=True,
+            )
+
+            print("Parkiet worker ready", flush=True)
+            self.ready.set()
+
+            while True:
+                job = self.jobs.get()
+                self._handle_job(job)
+
+        except Exception as exc:
+            import traceback
+
+            self.failed = exc
+            print("Parkiet worker failed:", repr(exc), flush=True)
+            traceback.print_exc()
+            self.ready.set()
+
+    def _handle_job(self, job: GenerationJob) -> None:
+        assert self.model is not None
+
+        try:
+            if job.cancelled.is_set():
+                job.output_queue.put(None)
+                return
+
+            preset = VOICE_PRESETS[job.voice]
+            text = normalize_text(job.text, preset["speaker"])
+
+            seed = int(preset.get("seed", 2202))
+
+            import random
+            import torch
+
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+
+            print(
+                f"Parkiet generation start voice={job.voice} seed={seed} text={text[:120]!r}",
+                flush=True,
+            )
+
+            def on_chunk(
+                audio_chunk: np.ndarray,
+                sample_rate: int,
+                chunk_index: int,
+                is_final: bool,
+            ) -> None:
+                if job.cancelled.is_set():
+                    return
+
+                pcm_bytes = float_audio_to_pcm16_bytes(audio_chunk)
+
+                job.output_queue.put(
+                    {
+                        "type": "chunk",
+                        "index": chunk_index,
+                        "is_final": is_final,
+                        "sample_rate": sample_rate,
+                        "bytes": pcm_bytes,
+                    }
+                )
+
+            self.model.generate(
+                text,
+                cfg_scale=preset["cfg_scale"],
+                temperature=preset["temperature"],
+                top_p=preset["top_p"],
+                cfg_filter_top_k=preset["cfg_filter_top_k"],
+                use_torch_compile=True,
+                verbose=True,
+                stream_callback=on_chunk,
+                stream_probe_every_tokens=86,
+            )
+
+            print("Parkiet generation done", flush=True)
+
+        except Exception as exc:
+            import traceback
+
+            print("Parkiet generation error:", repr(exc), flush=True)
+            traceback.print_exc()
+            job.output_queue.put({"type": "error", "message": str(exc) or repr(exc)})
+        finally:
+            job.output_queue.put(None)
+
+
+app = FastAPI()
+WORKER = ParkietWorker()
+
+
+def normalize_text(text: str, speaker: str) -> str:
+    text = text.strip()
+
+    for tag in ("[S1]", "[S2]"):
+        if text.startswith(tag):
+            text = text[len(tag):].strip()
+
+    return f"[{speaker}] {text}"
+
+
+def float_audio_to_pcm16_bytes(audio: np.ndarray) -> bytes:
+    audio = np.asarray(audio, dtype=np.float32)
+    audio = np.clip(audio, -1.0, 1.0)
+    pcm16 = (audio * 32767.0).astype("<i2")
+    return pcm16.tobytes()
+
+
+@app.on_event("startup")
+def startup() -> None:
+    WORKER.start()
+    WORKER.ready.wait()
+
+    if WORKER.failed is not None:
+        raise WORKER.failed
+
+    print("Parkiet realtime TTS server ready", flush=True)
+
+
+@app.get("/health")
+def health() -> dict[str, Any]:
+    return {
+        "ok": WORKER.ready.is_set() and WORKER.failed is None,
+        "model_loaded": WORKER.model is not None,
+        "voice": "s2_plain_t10",
+        "sample_rate": DEFAULT_SAMPLE_RATE,
+        "format": "pcm_s16le",
+        "channels": 1,
+        "compile": True,
+        "worker_thread": True,
+    }
+
+
+@app.websocket("/ws/tts")
+async def ws_tts(websocket: WebSocket) -> None:
+    await websocket.accept()
+
+    if WORKER.failed is not None or WORKER.model is None:
+        await websocket.send_json({"type": "error", "message": "model not loaded"})
+        await websocket.close()
+        return
+
+    job: GenerationJob | None = None
+
+    try:
+        payload = await websocket.receive_json()
+        request = TtsRequest(**payload)
+
+        if request.voice not in VOICE_PRESETS:
+            await websocket.send_json(
+                {"type": "error", "message": f"unknown voice: {request.voice}"}
+            )
+            await websocket.close()
+            return
+
+        output_queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
+
+        job = GenerationJob(
+            text=request.text,
+            voice=request.voice,
+            output_queue=output_queue,
+        )
+
+        await websocket.send_json(
+            {
+                "type": "start",
+                "sample_rate": DEFAULT_SAMPLE_RATE,
+                "format": "pcm_s16le",
+                "channels": 1,
+                "voice": request.voice,
+            }
+        )
+
+        WORKER.submit(job)
+
+        while True:
+            item = await asyncio.to_thread(output_queue.get)
+
+            if item is None:
+                await websocket.send_json({"type": "done"})
+                break
+
+            if item.get("type") == "error":
+                await websocket.send_json(
+                    {"type": "error", "message": item.get("message", "unknown error")}
+                )
+                break
+
+            await websocket.send_json(
+                {
+                    "type": "chunk",
+                    "index": item["index"],
+                    "is_final": item["is_final"],
+                    "sample_rate": item["sample_rate"],
+                    "format": "pcm_s16le",
+                    "channels": 1,
+                    "bytes": len(item["bytes"]),
+                }
+            )
+            await websocket.send_bytes(item["bytes"])
+
+    except WebSocketDisconnect:
+        if job is not None:
+            job.cancelled.set()
+        return
+    except Exception as exc:
+        if job is not None:
+            job.cancelled.set()
+
+        import traceback
+
+        print("Parkiet WS error:", repr(exc), flush=True)
+        traceback.print_exc()
+
+        try:
+            await websocket.send_json({"type": "error", "message": str(exc)})
+        except Exception:
+            pass
+    finally:
+        if job is not None:
+            job.cancelled.set()
+
+        try:
+            await websocket.close()
+        except Exception:
+            pass

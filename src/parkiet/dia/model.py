@@ -655,6 +655,9 @@ class Dia:
         | None = None,
         use_cfg_filter: bool | None = None,
         verbose: bool = False,
+        stream_probe_dir: str | None = None,
+        stream_probe_every_tokens: int = 86,
+        stream_callback = None,
     ) -> np.ndarray | list[np.ndarray]:
         """Generates audio corresponding to the input text.
 
@@ -755,6 +758,16 @@ class Dia:
 
         bos_over = False
 
+        # --- Stream probe init ---
+        _probe_prefill = dec_output.prefill_steps[0]
+        _probe_sample_count = 0
+        _probe_chunk_idx = 0
+
+        if stream_probe_dir is not None:
+            from pathlib import Path
+
+            Path(stream_probe_dir).mkdir(parents=True, exist_ok=True)
+
         if verbose:
             print("generate: starting generation loop")
             if use_torch_compile:
@@ -826,6 +839,67 @@ class Dia:
 
             dec_step += 1
 
+            # --- Stream probe ---
+            if (
+                (stream_probe_dir is not None or stream_callback is not None)
+                and self.load_dac
+                and dec_step > 0
+                and dec_step % stream_probe_every_tokens == 0
+            ):
+                _n_tokens = dec_step - _probe_prefill
+
+                if _n_tokens > max_delay_pattern:
+                    _window = dec_output.generated_tokens[
+                        0,
+                        _probe_prefill : _probe_prefill + _n_tokens,
+                        :,
+                    ].unsqueeze(0)
+
+                    _n_valid = max(0, _n_tokens - max_delay_pattern)
+
+                    if _n_valid > 0:
+                        _probe_lengths = torch.tensor(
+                            [_n_valid],
+                            dtype=torch.long,
+                            device=self.device,
+                        )
+
+                        _audio_so_far = self._generate_output(
+                            _window,
+                            _probe_lengths,
+                        )[0]
+
+                        _chunk = _audio_so_far[_probe_sample_count:]
+                        _probe_sample_count = len(_audio_so_far)
+
+                        if len(_chunk) > 0:
+                            _probe_chunk_idx += 1
+
+                            _chunk_tensor = torch.from_numpy(_chunk).float().cpu()
+
+                            if _chunk_tensor.ndim == 1:
+                                _chunk_tensor = _chunk_tensor.unsqueeze(0)
+
+                            if stream_callback is not None:
+                                stream_callback(
+                                    _chunk,
+                                    DEFAULT_SAMPLE_RATE,
+                                    _probe_chunk_idx,
+                                    False,
+                                )
+
+                            if stream_probe_dir is not None:
+                                torchaudio.save(
+                                    f"{stream_probe_dir}/chunk_{_probe_chunk_idx:03d}.wav",
+                                    _chunk_tensor,
+                                    DEFAULT_SAMPLE_RATE,
+                                )
+
+                            if verbose:
+                                print(
+                                    f"stream probe: saved chunk {_probe_chunk_idx:03d}, samples={len(_chunk)}"
+                                )
+
             if verbose and dec_step % 86 == 0:
                 duration = time.time() - start_time
                 if duration > 0:
@@ -877,6 +951,44 @@ class Dia:
             del dec_state
 
             outputs = self._generate_output(generated_codes, lengths_Bx)
+
+            # --- Stream probe final tail ---
+            if (
+                (stream_probe_dir is not None or stream_callback is not None)
+                and self.load_dac
+                and outputs
+                and outputs[0] is not None
+            ):
+                _final_audio = outputs[0]
+                _final_tail = _final_audio[_probe_sample_count:]
+
+                if len(_final_tail) > 0:
+                    _probe_chunk_idx += 1
+
+                    _final_tail_tensor = torch.from_numpy(_final_tail).float().cpu()
+
+                    if _final_tail_tensor.ndim == 1:
+                        _final_tail_tensor = _final_tail_tensor.unsqueeze(0)
+
+                    if stream_callback is not None:
+                        stream_callback(
+                            _final_tail,
+                            DEFAULT_SAMPLE_RATE,
+                            _probe_chunk_idx,
+                            True,
+                        )
+
+                    if stream_probe_dir is not None:
+                        torchaudio.save(
+                            f"{stream_probe_dir}/chunk_{_probe_chunk_idx:03d}_final.wav",
+                            _final_tail_tensor,
+                            DEFAULT_SAMPLE_RATE,
+                        )
+
+                    if verbose:
+                        print(
+                            f"stream probe: saved final tail chunk {_probe_chunk_idx:03d}, samples={len(_final_tail)}"
+                        )
         else:
             print("Warning: Nothing generated for any sequence in the batch.")
             outputs = [None] * batch_size
