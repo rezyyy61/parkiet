@@ -1,0 +1,32 @@
+nohup: ignoring input
+warning: The `tool.uv.dev-dependencies` field (used in `pyproject.toml`) is deprecated and will be removed in a future release; use `dependency-groups.dev` instead
+INFO:     Started server process [101311]
+INFO:     Waiting for application startup.
+loading Parkiet model inside generation worker...
+/workspace/venvs/parkiet-venv/lib/python3.12/site-packages/torch/nn/utils/weight_norm.py:144: FutureWarning: `torch.nn.utils.weight_norm` is deprecated in favor of `torch.nn.utils.parametrizations.weight_norm`.
+  WeightNorm.apply(module, name, dim)
+warming up torch.compile inside same worker thread...
+W0519 14:10:14.259000 101311 torch/fx/experimental/symbolic_shapes.py:6823] [1/0] _maybe_guard_rel() was called on non-relation expression Eq(s98, 1) | Eq(s98, 1024)
+generate: starting generation loop
+generate: using use_torch_compile=True, the first step may be slow
+generate step 86: speed=16.643 tokens/s, realtime factor=0.194x
+generate: avg steps=111.0, total duration=25.595s
+Parkiet worker ready
+Parkiet realtime TTS server ready
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8888 (Press CTRL+C to quit)
+INFO:     127.0.0.1:49454 - "WebSocket /ws/tts" [accepted]
+INFO:     connection open
+Parkiet generation start voice=s2_plain_t10 seed=2202 text='[S2] Goedemiddag Jan, met Bart van Circle en Borne. Mag ik je even kort storen?'
+generate_stream: starting generation loop
+generate_stream step 86: speed=107.855 tokens/s, realtime factor=1.254x
+generate_stream step 172: speed=164.893 tokens/s, realtime factor=1.917x
+generate_stream step 258: speed=164.669 tokens/s, realtime factor=1.915x
+generate_stream step 344: speed=164.763 tokens/s, realtime factor=1.916x
+generate_stream: chunks=18, total duration=2.598s
+Parkiet generation done
+INFO:     connection closed
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [101311]
