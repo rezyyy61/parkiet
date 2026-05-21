@@ -191,8 +191,10 @@ class StandardOutputStreamer:
     def __init__(
         self,
         model: Dia,
+        decode_start: int,
         prefill_step: int,
         max_delay_pattern: int,
+        prompt_context_frames: int,
         lookahead_frames: int,
         min_commit_frames: int,
         overlap_frames: int,
@@ -200,8 +202,10 @@ class StandardOutputStreamer:
         verbose: bool = False,
     ) -> None:
         self.model = model
+        self.decode_start = decode_start
         self.prefill_step = prefill_step
         self.max_delay_pattern = max_delay_pattern
+        self.prompt_context_frames = prompt_context_frames
         self.lookahead_frames = lookahead_frames
         self.min_commit_frames = max(1, min_commit_frames)
         self.overlap_frames = overlap_frames
@@ -222,17 +226,19 @@ class StandardOutputStreamer:
         available_delayed_frames = available_until_step - self.prefill_step + 1
 
         if final_length_frames is None:
-            valid_frames = available_delayed_frames - self.max_delay_pattern
-            commit_until_frame = valid_frames - self.lookahead_frames
+            valid_generated_frames = available_delayed_frames - self.max_delay_pattern
+            commit_until_frame = valid_generated_frames - self.lookahead_frames
         else:
-            valid_frames = final_length_frames
-            available_delayed_frames = valid_frames + self.max_delay_pattern
-            commit_until_frame = valid_frames
+            valid_generated_frames = final_length_frames
+            available_delayed_frames = (
+                valid_generated_frames + self.max_delay_pattern
+            )
+            commit_until_frame = valid_generated_frames
 
-        if valid_frames <= 0 or available_delayed_frames <= 0:
+        if valid_generated_frames <= 0 or available_delayed_frames <= 0:
             return []
 
-        commit_until_frame = max(0, min(commit_until_frame, valid_frames))
+        commit_until_frame = max(0, min(commit_until_frame, valid_generated_frames))
         frames_to_commit = commit_until_frame - self.committed_frames
 
         if frames_to_commit <= 0:
@@ -241,20 +247,24 @@ class StandardOutputStreamer:
         if final_length_frames is None and frames_to_commit < self.min_commit_frames:
             return []
 
+        total_valid_frames = self.prompt_context_frames + valid_generated_frames
+        total_delayed_frames = total_valid_frames + self.max_delay_pattern
+
         delayed_codes = dec_output.generated_tokens[
             0:1,
-            self.prefill_step : self.prefill_step + available_delayed_frames,
+            self.decode_start : self.decode_start + total_delayed_frames,
             :,
         ]
         lengths = torch.tensor(
-            [valid_frames],
+            [total_valid_frames],
             dtype=torch.long,
             device=self.model.device,
         )
         audio = self.model._generate_output(delayed_codes, lengths)[0]
 
-        start_sample = self.committed_frames * SAMPLE_RATE_RATIO
-        end_sample = commit_until_frame * SAMPLE_RATE_RATIO
+        discard_samples = self.prompt_context_frames * SAMPLE_RATE_RATIO
+        start_sample = discard_samples + self.committed_frames * SAMPLE_RATE_RATIO
+        end_sample = discard_samples + commit_until_frame * SAMPLE_RATE_RATIO
 
         if audio is None or len(audio) < end_sample or end_sample <= start_sample:
             return []
@@ -263,7 +273,8 @@ class StandardOutputStreamer:
             print(
                 "generate_stream: first emitted generated frame "
                 f"index={self.prefill_step} valid_frame=0 "
-                f"available_delayed_frames={available_delayed_frames}",
+                f"available_delayed_frames={available_delayed_frames} "
+                f"decode_start={self.decode_start}",
                 flush=True,
             )
             self.first_frame_logged = True
@@ -300,9 +311,17 @@ class StandardOutputStreamer:
         if self.verbose:
             print(
                 "generate_stream: commit "
-                f"anchored={self.anchored} available_frames={valid_frames} "
+                f"anchored={self.anchored} "
+                f"available_generated_frames={valid_generated_frames} "
                 f"lookahead_frames={self.lookahead_frames} "
-                f"commit_frames={self.committed_frames}:{commit_until_frame} "
+                f"decode_start={self.decode_start} "
+                f"prefill_step={self.prefill_step} "
+                f"prompt_context_frames={self.prompt_context_frames} "
+                f"decoded_frames={self.decode_start}:"
+                f"{self.decode_start + total_valid_frames} "
+                f"emit_generated_frames={self.committed_frames}:"
+                f"{commit_until_frame} "
+                f"discarded_prompt_context_samples={discard_samples} "
                 f"pcm_samples={start_sample}:{end_sample}",
                 flush=True,
             )
@@ -352,6 +371,10 @@ def generate_stream_pcm(
         "PARKIET_STREAM_MIN_COMMIT_FRAMES",
         24 if audio_prompt_enabled else chunk_frames,
     )
+    stream_prompt_context_frames = _env_int(
+        "PARKIET_STREAM_PROMPT_CONTEXT_FRAMES",
+        128 if audio_prompt_enabled else 0,
+    )
 
     audio_eos_value = model.config.eos_token_id
     audio_pad_value = model.config.pad_token_id
@@ -392,6 +415,8 @@ def generate_stream_pcm(
     prefill_step = dec_output.prefill_steps[0]
     dec_step = min(dec_output.prefill_steps) - 1
     current_idx = torch.tensor([dec_step], device=model.device)
+    decode_start = max(0, prefill_step - stream_prompt_context_frames)
+    actual_prompt_context_frames = prefill_step - decode_start
 
     eos_detected_Bx = torch.zeros(
         (batch_size,),
@@ -415,8 +440,10 @@ def generate_stream_pcm(
 
     output_streamer = StandardOutputStreamer(
         model=model,
+        decode_start=decode_start,
         prefill_step=prefill_step,
         max_delay_pattern=max_delay_pattern,
+        prompt_context_frames=actual_prompt_context_frames,
         lookahead_frames=stream_lookahead_frames,
         min_commit_frames=stream_min_commit_frames,
         overlap_frames=overlap_frames,
@@ -435,6 +462,8 @@ def generate_stream_pcm(
             f"enabled={audio_prompt_enabled} prompt_frames={audio_prompt_frames} "
             f"prefill_step={prefill_step} initial_dec_step={dec_step} "
             f"max_delay={max_delay_pattern} "
+            f"decode_start={decode_start} "
+            f"prompt_context_frames={actual_prompt_context_frames} "
             f"lookahead_frames={stream_lookahead_frames} "
             f"min_commit_frames={stream_min_commit_frames}",
             flush=True,
