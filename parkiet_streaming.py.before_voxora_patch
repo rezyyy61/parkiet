@@ -1,4 +1,3 @@
-import threading
 import time
 from typing import Callable
 
@@ -172,8 +171,6 @@ def generate_stream_pcm(
     text: str,
     *,
     on_pcm_chunk: PcmCallback,
-    audio_prompt: torch.Tensor | str | None = None,
-    cancel_event: threading.Event | None = None,
     max_tokens: int = 3072,
     cfg_scale: float = 3.0,
     temperature: float = 1.0,
@@ -185,14 +182,6 @@ def generate_stream_pcm(
     verbose: bool = False,
 ) -> None:
     batch_size = 1
-
-    # Resolve audio_prompt into the list form expected by _prepare_generation.
-    if isinstance(audio_prompt, str):
-        resolved_audio_prompt: list[torch.Tensor | None] = [model.load_audio(audio_prompt)]
-    elif isinstance(audio_prompt, torch.Tensor):
-        resolved_audio_prompt = [audio_prompt]
-    else:
-        resolved_audio_prompt = [None]
 
     audio_eos_value = model.config.eos_token_id
     audio_pad_value = model.config.pad_token_id
@@ -222,11 +211,13 @@ def generate_stream_pcm(
     text_tokens = [model._encode_text(text)]
     text_tensor = model._pad_text_input(text_tokens)
 
+    audio_prompt = [None]
+
     total_start_time = time.time()
 
     dec_state, dec_output = model._prepare_generation(
         text_tensor,
-        resolved_audio_prompt,
+        audio_prompt,
         max_tokens=max_tokens,
     )
 
@@ -262,19 +253,12 @@ def generate_stream_pcm(
     )
 
     chunk_index = 0
-    # Hold-back buffer: we keep one chunk pending so we can tag the truly last
-    # emitted chunk as is_final=True exactly once.
-    pending_chunk: np.ndarray | None = None
 
     if verbose:
         print("generate_stream: starting generation loop", flush=True)
         start_time = time.time()
 
     while dec_step < max_tokens:
-        if cancel_event is not None and cancel_event.is_set():
-            del dec_state
-            return
-
         if (eos_countdown_Bx == 0).all():
             break
 
@@ -356,11 +340,13 @@ def generate_stream_pcm(
                 aligned_frame = delay_resolver.pop()
 
                 for chunk in dac_streamer.push(aligned_frame):
-                    # Stage chunk: emit previous pending as non-final, hold current.
-                    if pending_chunk is not None:
-                        chunk_index += 1
-                        on_pcm_chunk(pending_chunk, DEFAULT_SAMPLE_RATE, chunk_index, False)
-                    pending_chunk = chunk
+                    chunk_index += 1
+                    on_pcm_chunk(
+                        chunk,
+                        DEFAULT_SAMPLE_RATE,
+                        chunk_index,
+                        False,
+                    )
 
         dec_step += 1
 
@@ -375,32 +361,28 @@ def generate_stream_pcm(
 
             start_time = time.time()
 
-    # Drain any remaining aligned frames from the delay resolver.
     while delay_resolver.has_aligned():
         aligned_frame = delay_resolver.pop()
 
         for chunk in dac_streamer.push(aligned_frame):
-            if pending_chunk is not None:
-                chunk_index += 1
-                on_pcm_chunk(pending_chunk, DEFAULT_SAMPLE_RATE, chunk_index, False)
-            pending_chunk = chunk
+            chunk_index += 1
+            on_pcm_chunk(
+                chunk,
+                DEFAULT_SAMPLE_RATE,
+                chunk_index,
+                False,
+            )
 
     final_chunk = dac_streamer.flush()
 
     if final_chunk is not None and len(final_chunk) > 0:
-        # Emit staged pending chunk (if any) as non-final, then flush as the true final.
-        if pending_chunk is not None:
-            chunk_index += 1
-            on_pcm_chunk(pending_chunk, DEFAULT_SAMPLE_RATE, chunk_index, False)
-            pending_chunk = None
         chunk_index += 1
-        on_pcm_chunk(final_chunk, DEFAULT_SAMPLE_RATE, chunk_index, True)
-    else:
-        # No flush tail — the staged pending chunk is the true final.
-        if pending_chunk is not None:
-            chunk_index += 1
-            on_pcm_chunk(pending_chunk, DEFAULT_SAMPLE_RATE, chunk_index, True)
-            pending_chunk = None
+        on_pcm_chunk(
+            final_chunk,
+            DEFAULT_SAMPLE_RATE,
+            chunk_index,
+            True,
+        )
 
     if verbose:
         total_duration = time.time() - total_start_time
