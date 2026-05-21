@@ -75,6 +75,19 @@ VOICE_PRESETS: dict[str, dict[str, Any]] = {
         "anchor_path": "voices/voxora_voice_01/anchor.wav",
         "anchor_text": "[S2] <transcript here>",
     },
+    "voxora_s2_t14": {
+        "speaker": "S1",
+        "temperature": 1.4,
+        "top_p": 0.95,
+        "cfg_scale": 3.0,
+        "cfg_filter_top_k": 45,
+        "seed": 2202,
+        "anchor_path": "voices/voxora_s2_t14/anchor.wav",
+        "anchor_text": (
+            "[S1] goedemiddag meneer, u spreekt met walter meijer, "
+            "ik bel u kort terug naar aanleiding van ons vorige gesprek."
+        ),
+    },
 }
 
 

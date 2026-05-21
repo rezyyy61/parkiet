@@ -166,6 +166,99 @@ class StreamingDacWindow:
         return tail.numpy()
 
 
+class StandardOutputStreamer:
+    """Incrementally emits PCM using Dia.generate's output extraction path."""
+
+    def __init__(
+        self,
+        model: Dia,
+        prefill_step: int,
+        max_delay_pattern: int,
+        chunk_frames: int,
+        overlap_frames: int,
+        verbose: bool = False,
+    ) -> None:
+        self.model = model
+        self.prefill_step = prefill_step
+        self.max_delay_pattern = max_delay_pattern
+        self.chunk_samples = chunk_frames * SAMPLE_RATE_RATIO
+        self.lookahead_samples = overlap_frames * SAMPLE_RATE_RATIO
+        self.verbose = verbose
+        self.emitted_samples = 0
+        self.first_frame_logged = False
+
+    def emit_available(
+        self,
+        dec_output,
+        available_until_step: int,
+        *,
+        final_length_frames: int | None = None,
+    ) -> list[np.ndarray]:
+        available_delayed_frames = available_until_step - self.prefill_step + 1
+
+        if final_length_frames is None:
+            valid_frames = available_delayed_frames - self.max_delay_pattern
+        else:
+            valid_frames = final_length_frames
+            available_delayed_frames = valid_frames + self.max_delay_pattern
+
+        if valid_frames <= 0 or available_delayed_frames <= 0:
+            return []
+
+        available_samples = valid_frames * SAMPLE_RATE_RATIO
+        if (
+            final_length_frames is None
+            and available_samples - self.emitted_samples
+            < self.chunk_samples + self.lookahead_samples
+        ):
+            return []
+
+        delayed_codes = dec_output.generated_tokens[
+            0:1,
+            self.prefill_step : self.prefill_step + available_delayed_frames,
+            :,
+        ]
+        lengths = torch.tensor(
+            [valid_frames],
+            dtype=torch.long,
+            device=self.model.device,
+        )
+
+        audio = self.model._generate_output(delayed_codes, lengths)[0]
+
+        if audio is None or len(audio) <= self.emitted_samples:
+            return []
+
+        if not self.first_frame_logged and self.verbose:
+            print(
+                "generate_stream: first emitted generated frame "
+                f"index={self.prefill_step} valid_frame=0 "
+                f"available_delayed_frames={available_delayed_frames}",
+                flush=True,
+            )
+            self.first_frame_logged = True
+
+        chunks: list[np.ndarray] = []
+        is_final = final_length_frames is not None
+
+        while self.emitted_samples < len(audio):
+            remaining = len(audio) - self.emitted_samples
+
+            if (
+                not is_final
+                and remaining < self.chunk_samples + self.lookahead_samples
+            ):
+                break
+
+            take = remaining if is_final else self.chunk_samples
+            start = self.emitted_samples
+            end = start + take
+            chunks.append(np.asarray(audio[start:end], dtype=np.float32))
+            self.emitted_samples = end
+
+        return chunks
+
+
 @torch.inference_mode()
 def generate_stream_pcm(
     model: Dia,
@@ -193,6 +286,10 @@ def generate_stream_pcm(
         resolved_audio_prompt = [audio_prompt]
     else:
         resolved_audio_prompt = [None]
+    audio_prompt_enabled = resolved_audio_prompt[0] is not None
+    audio_prompt_frames = (
+        int(resolved_audio_prompt[0].shape[0]) if audio_prompt_enabled else 0
+    )
 
     audio_eos_value = model.config.eos_token_id
     audio_pad_value = model.config.pad_token_id
@@ -254,11 +351,13 @@ def generate_stream_pcm(
 
     bos_over = False
 
-    delay_resolver = DelayResolver(delay_pattern)
-    dac_streamer = StreamingDacWindow(
+    output_streamer = StandardOutputStreamer(
         model=model,
+        prefill_step=prefill_step,
+        max_delay_pattern=max_delay_pattern,
         chunk_frames=chunk_frames,
         overlap_frames=overlap_frames,
+        verbose=verbose,
     )
 
     chunk_index = 0
@@ -267,6 +366,13 @@ def generate_stream_pcm(
     pending_chunk: np.ndarray | None = None
 
     if verbose:
+        print(
+            "generate_stream: audio_prompt "
+            f"enabled={audio_prompt_enabled} prompt_frames={audio_prompt_frames} "
+            f"prefill_step={prefill_step} initial_dec_step={dec_step} "
+            f"max_delay={max_delay_pattern}",
+            flush=True,
+        )
         print("generate_stream: starting generation loop", flush=True)
         start_time = time.time()
 
@@ -343,24 +449,20 @@ def generate_stream_pcm(
 
         dec_output.update_one(pred_BxC, current_step_idx, not bos_over)
 
-        if current_step_idx >= prefill_step:
-            delayed_frame = dec_output.generated_tokens[
-                0,
+        if current_step_idx >= prefill_step + max_delay_pattern:
+            for chunk in output_streamer.emit_available(
+                dec_output,
                 current_step_idx,
-                :,
-            ]
-
-            delay_resolver.push(delayed_frame)
-
-            while delay_resolver.has_aligned():
-                aligned_frame = delay_resolver.pop()
-
-                for chunk in dac_streamer.push(aligned_frame):
-                    # Stage chunk: emit previous pending as non-final, hold current.
-                    if pending_chunk is not None:
-                        chunk_index += 1
-                        on_pcm_chunk(pending_chunk, DEFAULT_SAMPLE_RATE, chunk_index, False)
-                    pending_chunk = chunk
+            ):
+                if pending_chunk is not None:
+                    chunk_index += 1
+                    on_pcm_chunk(pending_chunk, DEFAULT_SAMPLE_RATE, chunk_index, False)
+                elif verbose:
+                    print(
+                        f"generate_stream: first PCM chunk samples={len(chunk)}",
+                        flush=True,
+                    )
+                pending_chunk = chunk
 
         dec_step += 1
 
@@ -375,32 +477,34 @@ def generate_stream_pcm(
 
             start_time = time.time()
 
-    # Drain any remaining aligned frames from the delay resolver.
-    while delay_resolver.has_aligned():
-        aligned_frame = delay_resolver.pop()
+    final_step = dec_step + 1
+    finished_step_Bx[finished_step_Bx == -1] = final_step - max_delay_pattern
+    final_length_frames = int(
+        torch.clamp(finished_step_Bx[0] - prefill_step, min=0).item()
+    )
+    final_available_until_step = prefill_step + final_length_frames + max_delay_pattern - 1
 
-        for chunk in dac_streamer.push(aligned_frame):
-            if pending_chunk is not None:
-                chunk_index += 1
-                on_pcm_chunk(pending_chunk, DEFAULT_SAMPLE_RATE, chunk_index, False)
-            pending_chunk = chunk
+    final_chunks = output_streamer.emit_available(
+        dec_output,
+        final_available_until_step,
+        final_length_frames=final_length_frames,
+    )
 
-    final_chunk = dac_streamer.flush()
-
-    if final_chunk is not None and len(final_chunk) > 0:
-        # Emit staged pending chunk (if any) as non-final, then flush as the true final.
+    for chunk in final_chunks:
         if pending_chunk is not None:
             chunk_index += 1
             on_pcm_chunk(pending_chunk, DEFAULT_SAMPLE_RATE, chunk_index, False)
-            pending_chunk = None
+        elif verbose:
+            print(
+                f"generate_stream: first PCM chunk samples={len(chunk)}",
+                flush=True,
+            )
+        pending_chunk = chunk
+
+    if pending_chunk is not None:
         chunk_index += 1
-        on_pcm_chunk(final_chunk, DEFAULT_SAMPLE_RATE, chunk_index, True)
-    else:
-        # No flush tail — the staged pending chunk is the true final.
-        if pending_chunk is not None:
-            chunk_index += 1
-            on_pcm_chunk(pending_chunk, DEFAULT_SAMPLE_RATE, chunk_index, True)
-            pending_chunk = None
+        on_pcm_chunk(pending_chunk, DEFAULT_SAMPLE_RATE, chunk_index, True)
+        pending_chunk = None
 
     if verbose:
         total_duration = time.time() - total_start_time
