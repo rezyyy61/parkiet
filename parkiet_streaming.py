@@ -1,3 +1,4 @@
+import os
 import threading
 import time
 from typing import Callable
@@ -9,6 +10,24 @@ from parkiet.dia.model import Dia, DEFAULT_SAMPLE_RATE, SAMPLE_RATE_RATIO
 
 
 PcmCallback = Callable[[np.ndarray, int, int, bool], None]
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+
+    if value is None:
+        return default
+
+    try:
+        parsed = int(value)
+    except ValueError:
+        print(
+            f"Warning: invalid {name}={value!r}; using {default}",
+            flush=True,
+        )
+        return default
+
+    return max(0, parsed)
 
 
 class DelayResolver:
@@ -174,17 +193,23 @@ class StandardOutputStreamer:
         model: Dia,
         prefill_step: int,
         max_delay_pattern: int,
-        chunk_frames: int,
+        lookahead_frames: int,
+        min_commit_frames: int,
         overlap_frames: int,
+        anchored: bool,
         verbose: bool = False,
     ) -> None:
         self.model = model
         self.prefill_step = prefill_step
         self.max_delay_pattern = max_delay_pattern
-        self.chunk_samples = chunk_frames * SAMPLE_RATE_RATIO
-        self.lookahead_samples = overlap_frames * SAMPLE_RATE_RATIO
+        self.lookahead_frames = lookahead_frames
+        self.min_commit_frames = max(1, min_commit_frames)
+        self.overlap_frames = overlap_frames
+        self.anchored = anchored
         self.verbose = verbose
+        self.committed_frames = 0
         self.emitted_samples = 0
+        self.prev_tail: np.ndarray | None = None
         self.first_frame_logged = False
 
     def emit_available(
@@ -198,19 +223,22 @@ class StandardOutputStreamer:
 
         if final_length_frames is None:
             valid_frames = available_delayed_frames - self.max_delay_pattern
+            commit_until_frame = valid_frames - self.lookahead_frames
         else:
             valid_frames = final_length_frames
             available_delayed_frames = valid_frames + self.max_delay_pattern
+            commit_until_frame = valid_frames
 
         if valid_frames <= 0 or available_delayed_frames <= 0:
             return []
 
-        available_samples = valid_frames * SAMPLE_RATE_RATIO
-        if (
-            final_length_frames is None
-            and available_samples - self.emitted_samples
-            < self.chunk_samples + self.lookahead_samples
-        ):
+        commit_until_frame = max(0, min(commit_until_frame, valid_frames))
+        frames_to_commit = commit_until_frame - self.committed_frames
+
+        if frames_to_commit <= 0:
+            return []
+
+        if final_length_frames is None and frames_to_commit < self.min_commit_frames:
             return []
 
         delayed_codes = dec_output.generated_tokens[
@@ -223,10 +251,12 @@ class StandardOutputStreamer:
             dtype=torch.long,
             device=self.model.device,
         )
-
         audio = self.model._generate_output(delayed_codes, lengths)[0]
 
-        if audio is None or len(audio) <= self.emitted_samples:
+        start_sample = self.committed_frames * SAMPLE_RATE_RATIO
+        end_sample = commit_until_frame * SAMPLE_RATE_RATIO
+
+        if audio is None or len(audio) < end_sample or end_sample <= start_sample:
             return []
 
         if not self.first_frame_logged and self.verbose:
@@ -238,25 +268,49 @@ class StandardOutputStreamer:
             )
             self.first_frame_logged = True
 
-        chunks: list[np.ndarray] = []
-        is_final = final_length_frames is not None
+        chunk = np.asarray(audio[start_sample:end_sample], dtype=np.float32).copy()
+        if len(chunk) == 0:
+            return []
 
-        while self.emitted_samples < len(audio):
-            remaining = len(audio) - self.emitted_samples
+        overlap_samples = min(
+            self.overlap_frames * SAMPLE_RATE_RATIO // 2,
+            len(chunk),
+            len(self.prev_tail) if self.prev_tail is not None else 0,
+        )
 
-            if (
-                not is_final
-                and remaining < self.chunk_samples + self.lookahead_samples
-            ):
-                break
+        if overlap_samples > 0 and self.prev_tail is not None:
+            fade_in = np.linspace(0.0, 1.0, overlap_samples, dtype=np.float32)
+            fade_out = 1.0 - fade_in
+            chunk[:overlap_samples] = (
+                chunk[:overlap_samples] * fade_in
+                + self.prev_tail[-overlap_samples:] * fade_out
+            )
 
-            take = remaining if is_final else self.chunk_samples
-            start = self.emitted_samples
-            end = start + take
-            chunks.append(np.asarray(audio[start:end], dtype=np.float32))
-            self.emitted_samples = end
+        tail_samples = min(
+            self.overlap_frames * SAMPLE_RATE_RATIO,
+            end_sample,
+            len(audio),
+        )
+        tail_start = max(0, end_sample - tail_samples)
+        self.prev_tail = np.asarray(
+            audio[tail_start:end_sample],
+            dtype=np.float32,
+        ).copy()
 
-        return chunks
+        if self.verbose:
+            print(
+                "generate_stream: commit "
+                f"anchored={self.anchored} available_frames={valid_frames} "
+                f"lookahead_frames={self.lookahead_frames} "
+                f"commit_frames={self.committed_frames}:{commit_until_frame} "
+                f"pcm_samples={start_sample}:{end_sample}",
+                flush=True,
+            )
+
+        self.committed_frames = commit_until_frame
+        self.emitted_samples = end_sample
+
+        return [chunk]
 
 
 @torch.inference_mode()
@@ -289,6 +343,14 @@ def generate_stream_pcm(
     audio_prompt_enabled = resolved_audio_prompt[0] is not None
     audio_prompt_frames = (
         int(resolved_audio_prompt[0].shape[0]) if audio_prompt_enabled else 0
+    )
+    stream_lookahead_frames = _env_int(
+        "PARKIET_STREAM_LOOKAHEAD_FRAMES",
+        96 if audio_prompt_enabled else 32,
+    )
+    stream_min_commit_frames = _env_int(
+        "PARKIET_STREAM_MIN_COMMIT_FRAMES",
+        24 if audio_prompt_enabled else chunk_frames,
     )
 
     audio_eos_value = model.config.eos_token_id
@@ -355,8 +417,10 @@ def generate_stream_pcm(
         model=model,
         prefill_step=prefill_step,
         max_delay_pattern=max_delay_pattern,
-        chunk_frames=chunk_frames,
+        lookahead_frames=stream_lookahead_frames,
+        min_commit_frames=stream_min_commit_frames,
         overlap_frames=overlap_frames,
+        anchored=audio_prompt_enabled,
         verbose=verbose,
     )
 
@@ -370,7 +434,9 @@ def generate_stream_pcm(
             "generate_stream: audio_prompt "
             f"enabled={audio_prompt_enabled} prompt_frames={audio_prompt_frames} "
             f"prefill_step={prefill_step} initial_dec_step={dec_step} "
-            f"max_delay={max_delay_pattern}",
+            f"max_delay={max_delay_pattern} "
+            f"lookahead_frames={stream_lookahead_frames} "
+            f"min_commit_frames={stream_min_commit_frames}",
             flush=True,
         )
         print("generate_stream: starting generation loop", flush=True)
@@ -482,7 +548,9 @@ def generate_stream_pcm(
     final_length_frames = int(
         torch.clamp(finished_step_Bx[0] - prefill_step, min=0).item()
     )
-    final_available_until_step = prefill_step + final_length_frames + max_delay_pattern - 1
+    final_available_until_step = (
+        prefill_step + final_length_frames + max_delay_pattern - 1
+    )
 
     final_chunks = output_streamer.emit_available(
         dec_output,
