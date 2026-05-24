@@ -273,11 +273,24 @@ class _DiaGenerateProfiler:
             self.model._decode = wrapped_decode
 
         if self._orig_generate_output is not None:
-            def wrapped_generate_output(generated_codes, lengths_Bx):
-                token_lengths = [int(value) for value in lengths_Bx.detach().cpu().tolist()]
-                self.timings["generated_token_lengths"] = token_lengths
-                self.timings["generated_tokens"] = sum(token_lengths)
-                return self._time_call("generate_output_ms", self._orig_generate_output, generated_codes, lengths_Bx)
+            def wrapped_generate_output(*args, **kwargs):
+                lengths_Bx = None
+                if len(args) >= 2:
+                    lengths_Bx = args[1]
+                elif "lengths_Bx" in kwargs:
+                    lengths_Bx = kwargs["lengths_Bx"]
+
+                if lengths_Bx is not None and hasattr(lengths_Bx, "detach"):
+                    token_lengths = [int(value) for value in lengths_Bx.detach().cpu().tolist()]
+                    self.timings["generated_token_lengths"] = token_lengths
+                    self.timings["generated_tokens"] = sum(token_lengths)
+
+                return self._time_call(
+                    "generate_output_ms",
+                    self._orig_generate_output,
+                    *args,
+                    **kwargs,
+                )
             self.model._generate_output = wrapped_generate_output
 
         def timed_tensor_cpu(tensor, *args, **kwargs):

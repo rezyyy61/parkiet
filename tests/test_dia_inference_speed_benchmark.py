@@ -4,7 +4,16 @@ import numpy as np
 
 from parkiet.realtime.engine import DiaRealtimeBackend
 from parkiet.realtime.types import RealtimePhrase
-from scripts.dia_inference_speed_benchmark import build_presets, parse_args, parse_bool, preset_from_args, resolve_texts, summarize_runs
+from scripts.dia_inference_speed_benchmark import (
+    build_presets,
+    derive_decoder_step_calls,
+    derive_generated_tokens,
+    parse_args,
+    parse_bool,
+    preset_from_args,
+    resolve_texts,
+    summarize_runs,
+)
 
 
 def test_parse_bool():
@@ -106,6 +115,49 @@ def test_summarize_runs():
     assert summary["max_gpu_memory_bytes"] == 456
     assert summary["average_decoder_loop_ms"] == 77.0
     assert summary["average_decoder_step_calls"] == 56.5
+
+
+def test_compile_safe_fallback_extracts_generated_tokens_and_steps():
+    timings = {
+        "generated_tokens": 0,
+        "generated_token_count": [172],
+        "decoder_step_calls": 0,
+        "eos_step": [173],
+        "stop_step": [173],
+    }
+
+    assert derive_generated_tokens(timings) == 172
+    assert derive_decoder_step_calls(timings) == 173
+
+
+def test_compile_safe_summary_uses_generated_token_count_when_detailed_counts_missing():
+    runs = [
+        {
+            "generation_ms": 344.0,
+            "generated_audio_ms": 860.0,
+            "decode_ms": 0.0,
+            "decoder_loop_ms": 0.0,
+            "tokens_generated": 172,
+            "decoder_step_calls": 173,
+            "ms_per_token": 2.0,
+            "realtime_factor": 0.4,
+            "eos_detected": True,
+            "eos_step": 173,
+            "stop_step": 173,
+            "stop_reason": "eos",
+            "effective_audio_duration_ms": 860.0,
+            "max_tokens": 512,
+            "disable_cfg": True,
+            "timings": {"gpu_peak_memory_bytes": 123},
+        }
+    ]
+
+    summary = summarize_runs(runs, 100.0)
+
+    assert summary["total_tokens_generated"] == 172
+    assert summary["average_tokens_generated"] == 172
+    assert summary["average_ms_per_token"] == 2.0
+    assert summary["average_decoder_step_calls"] == 173
 
 
 def test_disable_cfg_flag_is_passed_safely():

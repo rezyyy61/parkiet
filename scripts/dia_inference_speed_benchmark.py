@@ -151,6 +151,32 @@ def scalarize_singleton(value):
     return value
 
 
+def derive_generated_tokens(timings: dict[str, object]) -> int:
+    generated_tokens = timings.get("generated_tokens", 0)
+    if generated_tokens:
+        return int(generated_tokens)
+
+    generated_token_count = scalarize_singleton(timings.get("generated_token_count"))
+    if generated_token_count is not None:
+        return int(generated_token_count)
+    return 0
+
+
+def derive_decoder_step_calls(timings: dict[str, object]) -> int:
+    decoder_step_calls = timings.get("decoder_step_calls", 0)
+    if decoder_step_calls:
+        return int(decoder_step_calls)
+
+    stop_step = scalarize_singleton(timings.get("stop_step"))
+    if stop_step is not None:
+        return int(stop_step)
+
+    eos_step = scalarize_singleton(timings.get("eos_step"))
+    if eos_step is not None:
+        return int(eos_step)
+    return 0
+
+
 def preset_from_args(args: argparse.Namespace) -> BenchmarkPreset:
     return BenchmarkPreset(
         name="custom",
@@ -230,12 +256,13 @@ def run_single_backend_benchmark(
             wall_ms = (perf_counter() - started) * 1000.0
             timings = dict(result.audio_chunk.metadata.get("timings", {}))
             generated_audio_ms = result.metrics.audio_duration_ms
-            tokens_generated = int(timings.get("generated_tokens", 0) or 0)
+            tokens_generated = derive_generated_tokens(timings)
             generation_ms = float(timings.get("total_ms", wall_ms) or wall_ms)
             decode_ms = float(timings.get("dac_decode_ms", 0.0) or 0.0)
             decoder_loop_ms = float(timings.get("decoder_loop_ms", 0.0) or 0.0)
             realtime_factor = generation_ms / generated_audio_ms if generated_audio_ms > 0.0 else float("inf")
             ms_per_token = generation_ms / tokens_generated if tokens_generated > 0 else float("inf")
+            decoder_step_calls = derive_decoder_step_calls(timings)
             run_metrics.append(
                 {
                     "repeat_index": repeat_index,
@@ -248,7 +275,7 @@ def run_single_backend_benchmark(
                     "tokens_generated": tokens_generated,
                     "ms_per_token": ms_per_token,
                     "realtime_factor": realtime_factor,
-                    "decoder_step_calls": int(timings.get("decoder_step_calls", 0) or 0),
+                    "decoder_step_calls": decoder_step_calls,
                     "eos_detected": scalarize_singleton(timings.get("eos_detected")),
                     "eos_step": scalarize_singleton(timings.get("eos_step")),
                     "stop_step": scalarize_singleton(timings.get("stop_step")),
