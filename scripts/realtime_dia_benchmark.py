@@ -13,7 +13,7 @@ import torch
 
 from parkiet.realtime import RealtimeTTSConfig, RealtimeTTSEngine, SessionNotFoundError
 from parkiet.realtime.engine import DiaRealtimeBackend
-from parkiet.realtime.types import PhraseSynthesisMetrics
+from parkiet.realtime.types import PhraseSynthesisMetrics, RealtimePhrase
 
 
 DEFAULT_PHRASES = [
@@ -106,6 +106,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--voice-tag", default="[S1]")
     parser.add_argument("--output-dir", default="debug_realtime_dia")
     parser.add_argument("--realtime-sleep", action="store_true")
+    parser.add_argument("--warmup-runs", type=int, default=None)
+    parser.add_argument("--include-silence-in-output", type=parse_bool, default=False)
     return parser.parse_args(argv)
 
 
@@ -148,6 +150,14 @@ def build_backend_options(args: argparse.Namespace) -> dict[str, object]:
     }
 
 
+def resolve_warmup_runs(args: argparse.Namespace) -> int:
+    if args.warmup_runs is not None:
+        return args.warmup_runs
+    if args.preset == "realtime_fast":
+        return 1
+    return 0
+
+
 def load_backend(
     config_path: Path,
     checkpoint_path: Path,
@@ -174,6 +184,32 @@ def load_backend(
         hard_stop_after_tokens=backend_options["hard_stop_after_tokens"],
         collect_timings=True,
     )
+
+
+def run_warmup(
+    backend: DiaRealtimeBackend,
+    phrases: list[str],
+    *,
+    warmup_runs: int,
+) -> float:
+    if warmup_runs <= 0:
+        return 0.0
+
+    warmup_started = perf_counter()
+    for run_index in range(warmup_runs):
+        for phrase_index, phrase_text in enumerate(phrases):
+            backend(
+                phrase=RealtimePhrase(
+                    session_id=f"warmup-{run_index}",
+                    index=phrase_index,
+                    text=phrase_text,
+                    voice_tag=phrase_text.split(" ", 1)[0] if phrase_text.startswith("[") else "[S1]",
+                    source_text=phrase_text,
+                    is_final=phrase_index == len(phrases) - 1,
+                ),
+                config=None,  # type: ignore[arg-type]
+            )
+    return (perf_counter() - warmup_started) * 1000.0
 
 
 def decode_frame_payload(payload: bytes | np.ndarray, sample_format: str) -> np.ndarray:
@@ -250,6 +286,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         args.device,
         backend_options,
     )
+    warmup_runs = resolve_warmup_runs(args)
     config = RealtimeTTSConfig(
         output_sample_rate=args.output_sample_rate,
         frame_duration_ms=args.frame_duration_ms,
@@ -259,10 +296,11 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         prebuffer_ms=max(args.frame_duration_ms * 2, 40),
         start_playback_when_buffer_ms=max(args.frame_duration_ms * 2, 40),
     )
+    phrases = resolve_phrases(args.text, args.voice_tag)
+    warmup_ms = run_warmup(backend, phrases, warmup_runs=warmup_runs)
+
     engine = RealtimeTTSEngine(config=config, backend=backend)
     session = engine.create_session("realtime-dia-benchmark")
-
-    phrases = resolve_phrases(args.text, args.voice_tag)
     for index, phrase in enumerate(phrases):
         engine.accept_text(session.session_id, phrase, is_final=index == len(phrases) - 1)
 
@@ -275,6 +313,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     sequence_numbers: list[int] = []
     silence_final_violation = False
     reconstructed_frames: list[np.ndarray] = []
+    silence_frames_for_output: list[np.ndarray] = []
     simulated_clock_ms = 0.0
 
     while True:
@@ -293,7 +332,12 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
             decoded = decode_frame_payload(frame.payload, frame.sample_format)
             if decoded.size > 0:
-                reconstructed_frames.append(decoded)
+                if frame.is_silence:
+                    silence_frames_for_output.append(decoded)
+                    if args.include_silence_in_output:
+                        reconstructed_frames.append(decoded)
+                else:
+                    reconstructed_frames.append(decoded)
             simulated_clock_ms += frame.frame_duration_ms
             if frame.is_final:
                 break
@@ -372,11 +416,13 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "status": "PASS" if passed else "FAIL",
         "preset": args.preset,
         "backend_options": backend_options,
+        "warmup_runs": warmup_runs,
+        "warmup_ms": warmup_ms,
         "total_generated_audio_ms": total_generated_audio_ms,
         "total_generation_ms": total_generation_ms,
-        "average_realtime_factor": average_realtime_factor,
+        "measured_average_realtime_factor": average_realtime_factor,
         "max_realtime_factor": max_realtime_factor,
-        "first_audio_latency_ms": first_non_silence_frame_ms,
+        "first_measured_audio_latency_ms": first_non_silence_frame_ms,
         "first_frame_ready_ms": first_frame_ready_ms,
         "total_underruns": session_metrics["underrun_count"],
         "total_frames": len(sequence_numbers),
@@ -385,11 +431,20 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "final_frame_count": final_frame_count,
         "sequence_numbers_monotonic": monotonic_sequences,
         "simulated_clock_ms": simulated_clock_ms,
+        "include_silence_in_output": args.include_silence_in_output,
     }
 
     metadata = {
         "args": vars(args),
         "summary": summary,
+        "summary_print": {
+            "status": summary["status"],
+            "warmup_ms": summary["warmup_ms"],
+            "measured_average_realtime_factor": summary["measured_average_realtime_factor"],
+            "first_measured_audio_latency_ms": summary["first_measured_audio_latency_ms"],
+            "total_underruns": summary["total_underruns"],
+            "output_wav_path": summary["output_wav_path"],
+        },
         "session_metrics": session_metrics,
         "session_state_before_close": state_snapshot_before_close,
         "phrase_metrics": [serialize_phrase_metrics(metric) for metric in phrase_metrics],
@@ -400,8 +455,9 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
     print(f"Benchmark status: {summary['status']}")
     print(
-        f"RTF={summary['average_realtime_factor']:.4f} "
-        f"first_audio_latency_ms={summary['first_audio_latency_ms']}"
+        f"RTF={summary['measured_average_realtime_factor']:.4f} "
+        f"first_audio_latency_ms={summary['first_measured_audio_latency_ms']} "
+        f"warmup_ms={summary['warmup_ms']:.2f}"
     )
     for metric in phrase_benchmark_metrics:
         print(json.dumps(metric, ensure_ascii=False))
