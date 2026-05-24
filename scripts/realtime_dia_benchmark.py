@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 from dataclasses import asdict, dataclass
-from datetime import datetime
 from pathlib import Path
 from time import perf_counter, sleep
 from typing import Any
@@ -12,7 +11,6 @@ import numpy as np
 import soundfile as sf
 import torch
 
-from parkiet.dia.model import Dia
 from parkiet.realtime import RealtimeTTSConfig, RealtimeTTSEngine, SessionNotFoundError
 from parkiet.realtime.engine import DiaRealtimeBackend
 from parkiet.realtime.types import PhraseSynthesisMetrics
@@ -44,11 +42,63 @@ class PhraseBenchmarkMetrics:
     sample_format: str
 
 
+@dataclass(slots=True)
+class BenchmarkPreset:
+    name: str
+    compute_dtype: str = "float32"
+    use_torch_compile: bool = False
+    disable_cfg: bool = False
+    max_tokens: int = 3072
+    cfg_scale: float = 3.0
+    temperature: float = 1.8
+    top_p: float = 0.90
+    cfg_filter_top_k: int = 50
+    max_audio_seconds: float | None = None
+    max_output_tokens_per_char: float | None = None
+    hard_stop_after_tokens: int | None = None
+
+
+REALTIME_FAST_PRESET = BenchmarkPreset(
+    name="realtime_fast",
+    compute_dtype="bfloat16",
+    use_torch_compile=True,
+    disable_cfg=True,
+    max_tokens=512,
+    cfg_scale=1.0,
+    temperature=1.2,
+    top_p=0.85,
+    cfg_filter_top_k=20,
+    max_audio_seconds=2.0,
+    max_output_tokens_per_char=6.0,
+)
+
+
+def parse_bool(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark Parkiet realtime TTS with the actual Dia backend.")
     parser.add_argument("--config-path", default="config.json")
     parser.add_argument("--checkpoint-path", default="weights/dia-nl-v1.pth")
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
+    parser.add_argument("--preset", choices=["default", "realtime_fast"], default="default")
+    parser.add_argument("--use-torch-compile", type=parse_bool, default=None)
+    parser.add_argument("--disable-cfg", type=parse_bool, default=None)
+    parser.add_argument("--compute-dtype", choices=["bfloat16", "float16", "float32"], default=None)
+    parser.add_argument("--max-tokens", type=int, default=None)
+    parser.add_argument("--cfg-scale", type=float, default=None)
+    parser.add_argument("--temperature", type=float, default=None)
+    parser.add_argument("--top-p", type=float, default=None)
+    parser.add_argument("--cfg-filter-top-k", type=int, default=None)
+    parser.add_argument("--max-audio-seconds", type=float, default=None)
+    parser.add_argument("--max-output-tokens-per-char", type=float, default=None)
+    parser.add_argument("--hard-stop-after-tokens", type=int, default=None)
     parser.add_argument("--output-sample-rate", type=int, choices=[44100, 16000, 8000], default=16000)
     parser.add_argument("--sample-format", choices=["pcm16", "float32"], default="pcm16")
     parser.add_argument("--frame-duration-ms", type=int, default=20)
@@ -73,17 +123,57 @@ def require_model_files(config_path: Path, checkpoint_path: Path) -> None:
         )
 
 
-def load_backend(config_path: Path, checkpoint_path: Path, device_name: str) -> DiaRealtimeBackend:
+def build_backend_options(args: argparse.Namespace) -> dict[str, object]:
+    preset = REALTIME_FAST_PRESET if args.preset == "realtime_fast" else BenchmarkPreset(name="default")
+    return {
+        "compute_dtype": args.compute_dtype if args.compute_dtype is not None else preset.compute_dtype,
+        "use_torch_compile": args.use_torch_compile if args.use_torch_compile is not None else preset.use_torch_compile,
+        "disable_cfg": args.disable_cfg if args.disable_cfg is not None else preset.disable_cfg,
+        "max_tokens": args.max_tokens if args.max_tokens is not None else preset.max_tokens,
+        "cfg_scale": args.cfg_scale if args.cfg_scale is not None else preset.cfg_scale,
+        "temperature": args.temperature if args.temperature is not None else preset.temperature,
+        "top_p": args.top_p if args.top_p is not None else preset.top_p,
+        "cfg_filter_top_k": args.cfg_filter_top_k if args.cfg_filter_top_k is not None else preset.cfg_filter_top_k,
+        "max_audio_seconds": args.max_audio_seconds if args.max_audio_seconds is not None else preset.max_audio_seconds,
+        "max_output_tokens_per_char": (
+            args.max_output_tokens_per_char
+            if args.max_output_tokens_per_char is not None
+            else preset.max_output_tokens_per_char
+        ),
+        "hard_stop_after_tokens": (
+            args.hard_stop_after_tokens
+            if args.hard_stop_after_tokens is not None
+            else preset.hard_stop_after_tokens
+        ),
+    }
+
+
+def load_backend(
+    config_path: Path,
+    checkpoint_path: Path,
+    device_name: str,
+    backend_options: dict[str, object],
+) -> DiaRealtimeBackend:
     require_model_files(config_path, checkpoint_path)
     if device_name == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("Requested --device cuda but CUDA is not available.")
-    model = Dia.from_local(
+    return DiaRealtimeBackend.from_local_paths(
         config_path=str(config_path),
         checkpoint_path=str(checkpoint_path),
-        compute_dtype="float32",
+        compute_dtype=str(backend_options["compute_dtype"]),
         device=torch.device(device_name),
+        use_torch_compile=bool(backend_options["use_torch_compile"]),
+        max_tokens=int(backend_options["max_tokens"]),
+        cfg_scale=float(backend_options["cfg_scale"]),
+        temperature=float(backend_options["temperature"]),
+        top_p=float(backend_options["top_p"]),
+        cfg_filter_top_k=int(backend_options["cfg_filter_top_k"]),
+        disable_cfg=bool(backend_options["disable_cfg"]),
+        max_audio_seconds=backend_options["max_audio_seconds"],
+        max_output_tokens_per_char=backend_options["max_output_tokens_per_char"],
+        hard_stop_after_tokens=backend_options["hard_stop_after_tokens"],
+        collect_timings=True,
     )
-    return DiaRealtimeBackend(model)
 
 
 def decode_frame_payload(payload: bytes | np.ndarray, sample_format: str) -> np.ndarray:
@@ -153,7 +243,13 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    backend = load_backend(Path(args.config_path), Path(args.checkpoint_path), args.device)
+    backend_options = build_backend_options(args)
+    backend = load_backend(
+        Path(args.config_path),
+        Path(args.checkpoint_path),
+        args.device,
+        backend_options,
+    )
     config = RealtimeTTSConfig(
         output_sample_rate=args.output_sample_rate,
         frame_duration_ms=args.frame_duration_ms,
@@ -274,6 +370,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
     summary = {
         "status": "PASS" if passed else "FAIL",
+        "preset": args.preset,
+        "backend_options": backend_options,
         "total_generated_audio_ms": total_generated_audio_ms,
         "total_generation_ms": total_generation_ms,
         "average_realtime_factor": average_realtime_factor,
@@ -301,6 +399,10 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     metadata_path.write_text(json.dumps(metadata, indent=2))
 
     print(f"Benchmark status: {summary['status']}")
+    print(
+        f"RTF={summary['average_realtime_factor']:.4f} "
+        f"first_audio_latency_ms={summary['first_audio_latency_ms']}"
+    )
     for metric in phrase_benchmark_metrics:
         print(json.dumps(metric, ensure_ascii=False))
     print(json.dumps(summary, ensure_ascii=False, indent=2))
