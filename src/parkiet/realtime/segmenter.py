@@ -59,7 +59,7 @@ class DutchAwarePhraseSegmenter:
                 current = ""
 
         if current:
-            if is_final or self._should_flush(current, is_final=True):
+            if is_final:
                 ready_phrases.append(current)
             else:
                 remainder = self._with_voice_tag(voice_tag, current)
