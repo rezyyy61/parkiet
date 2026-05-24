@@ -48,6 +48,10 @@ class DiaLike(Protocol):
         verbose: bool = False,
         stream_probe_dir: str | None = None,
         stream_probe_every_tokens: int = 86,
+        disable_cfg: bool = False,
+        max_audio_seconds: float | None = None,
+        max_output_tokens_per_char: float | None = None,
+        hard_stop_after_tokens: int | None = None,
         stream_callback=None,
     ) -> np.ndarray | list[np.ndarray]:
         ...
@@ -76,6 +80,10 @@ class DiaRealtimeBackend:
         temperature: float = 1.8,
         top_p: float = 0.90,
         cfg_filter_top_k: int = 50,
+        disable_cfg: bool = False,
+        max_audio_seconds: float | None = None,
+        max_output_tokens_per_char: float | None = None,
+        hard_stop_after_tokens: int | None = None,
         collect_timings: bool = False,
         model_load_time_ms: float | None = None,
     ):
@@ -86,6 +94,10 @@ class DiaRealtimeBackend:
         self.temperature = temperature
         self.top_p = top_p
         self.cfg_filter_top_k = cfg_filter_top_k
+        self.disable_cfg = disable_cfg
+        self.max_audio_seconds = max_audio_seconds
+        self.max_output_tokens_per_char = max_output_tokens_per_char
+        self.hard_stop_after_tokens = hard_stop_after_tokens
         self.collect_timings = collect_timings
         self.model_load_time_ms = model_load_time_ms
         self.last_timing_breakdown: dict[str, float | int | list[int] | bool | None] = {}
@@ -110,6 +122,10 @@ class DiaRealtimeBackend:
             "temperature": self.temperature,
             "top_p": self.top_p,
             "cfg_filter_top_k": self.cfg_filter_top_k,
+            "disable_cfg": self.disable_cfg,
+            "max_audio_seconds": self.max_audio_seconds,
+            "max_output_tokens_per_char": self.max_output_tokens_per_char,
+            "hard_stop_after_tokens": self.hard_stop_after_tokens,
         }
 
         with _DiaGenerateProfiler(self.model, timings, enabled=self.collect_timings):
@@ -121,6 +137,10 @@ class DiaRealtimeBackend:
                 top_p=self.top_p,
                 cfg_filter_top_k=self.cfg_filter_top_k,
                 use_torch_compile=self.use_torch_compile,
+                disable_cfg=self.disable_cfg,
+                max_audio_seconds=self.max_audio_seconds,
+                max_output_tokens_per_char=self.max_output_tokens_per_char,
+                hard_stop_after_tokens=self.hard_stop_after_tokens,
                 verbose=False,
                 stream_callback=None,
             )
@@ -161,6 +181,10 @@ class DiaRealtimeBackend:
         temperature: float = 1.8,
         top_p: float = 0.90,
         cfg_filter_top_k: int = 50,
+        disable_cfg: bool = False,
+        max_audio_seconds: float | None = None,
+        max_output_tokens_per_char: float | None = None,
+        hard_stop_after_tokens: int | None = None,
         collect_timings: bool = False,
     ) -> "DiaRealtimeBackend":
         load_started = perf_counter()
@@ -180,6 +204,10 @@ class DiaRealtimeBackend:
             temperature=temperature,
             top_p=top_p,
             cfg_filter_top_k=cfg_filter_top_k,
+            disable_cfg=disable_cfg,
+            max_audio_seconds=max_audio_seconds,
+            max_output_tokens_per_char=max_output_tokens_per_char,
+            hard_stop_after_tokens=hard_stop_after_tokens,
             collect_timings=collect_timings,
             model_load_time_ms=model_load_time_ms,
         )
@@ -283,6 +311,8 @@ class _DiaGenerateProfiler:
                 torch.Tensor.cpu = self._orig_tensor_cpu
         self._synchronize()
         self.timings["total_ms"] = (perf_counter() - float(self.timings.pop("_call_started_at"))) * 1000.0
+        if hasattr(self.model, "last_generate_metadata"):
+            self.timings.update(getattr(self.model, "last_generate_metadata"))
         if isinstance(self._device, torch.device) and self._device.type == "cuda":
             self.timings["gpu_peak_memory_bytes"] = int(torch.cuda.max_memory_allocated(self._device))
 
