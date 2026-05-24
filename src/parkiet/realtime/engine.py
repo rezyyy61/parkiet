@@ -5,9 +5,11 @@ from datetime import datetime
 from pathlib import Path
 from time import perf_counter
 import threading
+from types import TracebackType
 from typing import Protocol
 
 import numpy as np
+import torch
 
 from parkiet.dia.model import DEFAULT_SAMPLE_RATE, Dia
 
@@ -64,30 +66,76 @@ class SessionRuntime:
 
 
 class DiaRealtimeBackend:
-    def __init__(self, model: DiaLike):
+    def __init__(
+        self,
+        model: DiaLike,
+        *,
+        use_torch_compile: bool = False,
+        max_tokens: int = 3072,
+        cfg_scale: float = 3.0,
+        temperature: float = 1.8,
+        top_p: float = 0.90,
+        cfg_filter_top_k: int = 50,
+        collect_timings: bool = False,
+        model_load_time_ms: float | None = None,
+    ):
         self.model = model
+        self.use_torch_compile = use_torch_compile
+        self.max_tokens = max_tokens
+        self.cfg_scale = cfg_scale
+        self.temperature = temperature
+        self.top_p = top_p
+        self.cfg_filter_top_k = cfg_filter_top_k
+        self.collect_timings = collect_timings
+        self.model_load_time_ms = model_load_time_ms
+        self.last_timing_breakdown: dict[str, float | int | list[int] | bool | None] = {}
 
     def __call__(self, phrase: RealtimePhrase, config: RealtimeTTSConfig) -> RealtimeSynthesisResult:
-        waveform = self.model.generate(
-            phrase.text,
-            cfg_scale=config.cfg_scale,
-            temperature=config.temperature,
-            top_p=config.top_p,
-            cfg_filter_top_k=config.cfg_filter_top_k,
-            use_torch_compile=False,
-            verbose=False,
-            stream_callback=None,
-        )
+        timings: dict[str, float | int | list[int] | bool | None] = {
+            "model_load_ms": self.model_load_time_ms,
+            "text_encode_ms": 0.0,
+            "prepare_generation_ms": 0.0,
+            "decoder_loop_ms": 0.0,
+            "decoder_step_calls": 0,
+            "generate_output_ms": 0.0,
+            "dac_decode_ms": 0.0,
+            "cpu_transfer_ms": 0.0,
+            "generated_tokens": 0,
+            "generated_token_lengths": [],
+            "total_ms": 0.0,
+            "gpu_peak_memory_bytes": None,
+            "use_torch_compile": self.use_torch_compile,
+            "max_tokens": self.max_tokens,
+            "cfg_scale": self.cfg_scale,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "cfg_filter_top_k": self.cfg_filter_top_k,
+        }
+
+        with _DiaGenerateProfiler(self.model, timings, enabled=self.collect_timings):
+            waveform = self.model.generate(
+                phrase.text,
+                max_tokens=self.max_tokens,
+                cfg_scale=self.cfg_scale,
+                temperature=self.temperature,
+                top_p=self.top_p,
+                cfg_filter_top_k=self.cfg_filter_top_k,
+                use_torch_compile=self.use_torch_compile,
+                verbose=False,
+                stream_callback=None,
+            )
         if isinstance(waveform, list):
             waveform = waveform[0]
 
         waveform_np = np.asarray(waveform, dtype=np.float32).reshape(-1)
+        self.last_timing_breakdown = timings
         chunk = AudioChunk(
             session_id=phrase.session_id,
             phrase_index=phrase.index,
             text=phrase.text,
             sample_rate=DEFAULT_SAMPLE_RATE,
             waveform=waveform_np,
+            metadata={"timings": timings},
         )
         metrics = PhraseSynthesisMetrics(
             phrase_index=phrase.index,
@@ -105,13 +153,154 @@ class DiaRealtimeBackend:
         config_path: str | Path = "config.json",
         checkpoint_path: str | Path = "weights/dia-nl-v1.pth",
         compute_dtype: str = "float32",
+        device: torch.device | None = None,
+        load_dac: bool = True,
+        use_torch_compile: bool = False,
+        max_tokens: int = 3072,
+        cfg_scale: float = 3.0,
+        temperature: float = 1.8,
+        top_p: float = 0.90,
+        cfg_filter_top_k: int = 50,
+        collect_timings: bool = False,
     ) -> "DiaRealtimeBackend":
+        load_started = perf_counter()
         model = Dia.from_local(
             config_path=str(config_path),
             checkpoint_path=str(checkpoint_path),
             compute_dtype=compute_dtype,
+            device=device,
+            load_dac=load_dac,
         )
-        return cls(model)
+        model_load_time_ms = (perf_counter() - load_started) * 1000.0
+        return cls(
+            model,
+            use_torch_compile=use_torch_compile,
+            max_tokens=max_tokens,
+            cfg_scale=cfg_scale,
+            temperature=temperature,
+            top_p=top_p,
+            cfg_filter_top_k=cfg_filter_top_k,
+            collect_timings=collect_timings,
+            model_load_time_ms=model_load_time_ms,
+        )
+
+
+class _DiaGenerateProfiler:
+    def __init__(
+        self,
+        model: DiaLike,
+        timings: dict[str, float | int | list[int] | bool | None],
+        *,
+        enabled: bool,
+    ):
+        self.model = model
+        self.timings = timings
+        self.enabled = enabled
+        self._orig_encode_text = None
+        self._orig_prepare_generation = None
+        self._orig_decoder_step = None
+        self._orig_generate_output = None
+        self._orig_decode = None
+        self._orig_tensor_cpu = None
+        self._device = getattr(model, "device", None)
+
+    def __enter__(self) -> "_DiaGenerateProfiler":
+        if not self.enabled:
+            self._reset_peak_memory()
+            self.timings["_call_started_at"] = perf_counter()
+            return self
+
+        self._reset_peak_memory()
+        self.timings["_call_started_at"] = perf_counter()
+
+        self._orig_encode_text = getattr(self.model, "_encode_text", None)
+        self._orig_prepare_generation = getattr(self.model, "_prepare_generation", None)
+        self._orig_decoder_step = getattr(self.model, "_decoder_step", None)
+        self._orig_generate_output = getattr(self.model, "_generate_output", None)
+        self._orig_decode = getattr(self.model, "_decode", None)
+        self._orig_tensor_cpu = torch.Tensor.cpu
+
+        if self._orig_encode_text is not None:
+            def wrapped_encode_text(text):
+                return self._time_call("text_encode_ms", self._orig_encode_text, text)
+            self.model._encode_text = wrapped_encode_text
+
+        if self._orig_prepare_generation is not None:
+            def wrapped_prepare_generation(*args, **kwargs):
+                return self._time_call("prepare_generation_ms", self._orig_prepare_generation, *args, **kwargs)
+            self.model._prepare_generation = wrapped_prepare_generation
+
+        if self._orig_decoder_step is not None:
+            def wrapped_decoder_step(*args, **kwargs):
+                self.timings["decoder_step_calls"] = int(self.timings["decoder_step_calls"]) + 1
+                return self._time_call("decoder_loop_ms", self._orig_decoder_step, *args, **kwargs)
+            self.model._decoder_step = wrapped_decoder_step
+
+        if self._orig_decode is not None:
+            def wrapped_decode(*args, **kwargs):
+                return self._time_call("dac_decode_ms", self._orig_decode, *args, **kwargs)
+            self.model._decode = wrapped_decode
+
+        if self._orig_generate_output is not None:
+            def wrapped_generate_output(generated_codes, lengths_Bx):
+                token_lengths = [int(value) for value in lengths_Bx.detach().cpu().tolist()]
+                self.timings["generated_token_lengths"] = token_lengths
+                self.timings["generated_tokens"] = sum(token_lengths)
+                return self._time_call("generate_output_ms", self._orig_generate_output, generated_codes, lengths_Bx)
+            self.model._generate_output = wrapped_generate_output
+
+        def timed_tensor_cpu(tensor, *args, **kwargs):
+            self._synchronize()
+            started = perf_counter()
+            result = self._orig_tensor_cpu(tensor, *args, **kwargs)
+            self._synchronize()
+            self.timings["cpu_transfer_ms"] = float(self.timings["cpu_transfer_ms"]) + (
+                (perf_counter() - started) * 1000.0
+            )
+            return result
+
+        torch.Tensor.cpu = timed_tensor_cpu
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        if self.enabled:
+            if self._orig_encode_text is not None:
+                self.model._encode_text = self._orig_encode_text
+            if self._orig_prepare_generation is not None:
+                self.model._prepare_generation = self._orig_prepare_generation
+            if self._orig_decoder_step is not None:
+                self.model._decoder_step = self._orig_decoder_step
+            if self._orig_generate_output is not None:
+                self.model._generate_output = self._orig_generate_output
+            if self._orig_decode is not None:
+                self.model._decode = self._orig_decode
+            if self._orig_tensor_cpu is not None:
+                torch.Tensor.cpu = self._orig_tensor_cpu
+        self._synchronize()
+        self.timings["total_ms"] = (perf_counter() - float(self.timings.pop("_call_started_at"))) * 1000.0
+        if isinstance(self._device, torch.device) and self._device.type == "cuda":
+            self.timings["gpu_peak_memory_bytes"] = int(torch.cuda.max_memory_allocated(self._device))
+
+    def _time_call(self, key: str, fn, *args, **kwargs):
+        self._synchronize()
+        started = perf_counter()
+        result = fn(*args, **kwargs)
+        self._synchronize()
+        self.timings[key] = float(self.timings[key]) + ((perf_counter() - started) * 1000.0)
+        return result
+
+    def _synchronize(self) -> None:
+        if isinstance(self._device, torch.device) and self._device.type == "cuda":
+            torch.cuda.synchronize(self._device)
+
+    def _reset_peak_memory(self) -> None:
+        if isinstance(self._device, torch.device) and self._device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(self._device)
 
 
 class RealtimeTTSEngine:
