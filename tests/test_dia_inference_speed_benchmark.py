@@ -171,3 +171,101 @@ def test_backend_defaults_preserve_existing_behavior_flags():
     assert call["max_audio_seconds"] is None
     assert call["max_output_tokens_per_char"] is None
     assert call["hard_stop_after_tokens"] is None
+
+
+def test_compile_safe_timing_metadata_does_not_enable_detailed_wrappers():
+    class FakeDia:
+        def __init__(self):
+            self.calls = []
+            self.last_generate_metadata = {
+                "generated_tokens": [42],
+                "generated_token_lengths": [42],
+                "stop_reason": ["max_tokens"],
+            }
+            self._encode_text = object()
+            self._prepare_generation = object()
+            self._decoder_step = object()
+            self._generate_output = object()
+            self._decode = object()
+
+        def generate(self, text, **kwargs):
+            self.calls.append(kwargs)
+            return np.zeros(4410, dtype=np.float32)
+
+    model = FakeDia()
+    original_prepare_generation = model._prepare_generation
+    original_decoder_step = model._decoder_step
+    backend = DiaRealtimeBackend(model, use_torch_compile=True, collect_timings=True)
+    phrase = RealtimePhrase(
+        session_id="test",
+        index=0,
+        text="[S1] Hallo",
+        voice_tag="[S1]",
+        source_text="[S1] Hallo",
+        is_final=True,
+    )
+
+    result = backend(phrase, None)  # type: ignore[arg-type]
+    timings = result.audio_chunk.metadata["timings"]
+
+    assert model._prepare_generation is original_prepare_generation
+    assert model._decoder_step is original_decoder_step
+    assert timings["timing_mode"] == "compile_safe"
+    assert timings["detailed_timings_enabled"] is False
+    assert timings["total_ms"] is not None
+    assert timings["generated_tokens"] == [42]
+    assert timings["prepare_generation_ms"] is None
+    assert timings["decoder_loop_ms"] is None
+
+
+def test_non_compile_mode_keeps_detailed_timing_fields():
+    class FakeDia:
+        def __init__(self):
+            self.calls = []
+            self.last_generate_metadata = {"generated_tokens": [7], "generated_token_lengths": [7]}
+            self.device = None
+
+        def _encode_text(self, text):
+            return text
+
+        def _prepare_generation(self, *args, **kwargs):
+            return None
+
+        def _decoder_step(self, *args, **kwargs):
+            return None
+
+        def _generate_output(self, *args, **kwargs):
+            return None
+
+        def _decode(self, *args, **kwargs):
+            return None
+
+        def generate(self, text, **kwargs):
+            self.calls.append(kwargs)
+            self._encode_text(text)
+            self._prepare_generation()
+            self._decoder_step()
+            self._generate_output()
+            self._decode()
+            return np.zeros(4410, dtype=np.float32)
+
+    backend = DiaRealtimeBackend(FakeDia(), use_torch_compile=False, collect_timings=True)
+    phrase = RealtimePhrase(
+        session_id="test",
+        index=0,
+        text="[S1] Hallo",
+        voice_tag="[S1]",
+        source_text="[S1] Hallo",
+        is_final=True,
+    )
+
+    result = backend(phrase, None)  # type: ignore[arg-type]
+    timings = result.audio_chunk.metadata["timings"]
+
+    assert timings["timing_mode"] == "detailed"
+    assert timings["detailed_timings_enabled"] is True
+    assert timings["text_encode_ms"] is not None
+    assert timings["prepare_generation_ms"] is not None
+    assert timings["decoder_loop_ms"] is not None
+    assert timings["generate_output_ms"] is not None
+    assert timings["dac_decode_ms"] is not None

@@ -105,18 +105,20 @@ class DiaRealtimeBackend:
     def __call__(self, phrase: RealtimePhrase, config: RealtimeTTSConfig) -> RealtimeSynthesisResult:
         timings: dict[str, float | int | list[int] | bool | None] = {
             "model_load_ms": self.model_load_time_ms,
-            "text_encode_ms": 0.0,
-            "prepare_generation_ms": 0.0,
-            "decoder_loop_ms": 0.0,
+            "text_encode_ms": None,
+            "prepare_generation_ms": None,
+            "decoder_loop_ms": None,
             "decoder_step_calls": 0,
-            "generate_output_ms": 0.0,
-            "dac_decode_ms": 0.0,
-            "cpu_transfer_ms": 0.0,
+            "generate_output_ms": None,
+            "dac_decode_ms": None,
+            "cpu_transfer_ms": None,
             "generated_tokens": 0,
             "generated_token_lengths": [],
             "total_ms": 0.0,
             "gpu_peak_memory_bytes": None,
             "use_torch_compile": self.use_torch_compile,
+            "timing_mode": "compile_safe" if self.use_torch_compile else "detailed",
+            "detailed_timings_enabled": self.collect_timings and not self.use_torch_compile,
             "max_tokens": self.max_tokens,
             "cfg_scale": self.cfg_scale,
             "temperature": self.temperature,
@@ -224,6 +226,7 @@ class _DiaGenerateProfiler:
         self.model = model
         self.timings = timings
         self.enabled = enabled
+        self.detailed_enabled = enabled and not bool(timings.get("use_torch_compile"))
         self._orig_encode_text = None
         self._orig_prepare_generation = None
         self._orig_decoder_step = None
@@ -233,7 +236,7 @@ class _DiaGenerateProfiler:
         self._device = getattr(model, "device", None)
 
     def __enter__(self) -> "_DiaGenerateProfiler":
-        if not self.enabled:
+        if not self.enabled or not self.detailed_enabled:
             self._reset_peak_memory()
             self.timings["_call_started_at"] = perf_counter()
             return self
@@ -296,7 +299,7 @@ class _DiaGenerateProfiler:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        if self.enabled:
+        if self.enabled and self.detailed_enabled:
             if self._orig_encode_text is not None:
                 self.model._encode_text = self._orig_encode_text
             if self._orig_prepare_generation is not None:
@@ -321,7 +324,9 @@ class _DiaGenerateProfiler:
         started = perf_counter()
         result = fn(*args, **kwargs)
         self._synchronize()
-        self.timings[key] = float(self.timings[key]) + ((perf_counter() - started) * 1000.0)
+        current_value = self.timings[key]
+        base_value = float(current_value) if current_value is not None else 0.0
+        self.timings[key] = base_value + ((perf_counter() - started) * 1000.0)
         return result
 
     def _synchronize(self) -> None:
