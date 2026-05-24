@@ -3,6 +3,7 @@ from .engine import DiaRealtimeBackend, RealtimeTTSEngine
 from .exceptions import BackendSynthesisError, RealtimeTTSError, SessionClosedError, SessionNotFoundError
 from .segmenter import DutchAwarePhraseSegmenter
 from .session import RealtimeTTSSession
+from .voice_registry import VoicePromptMetadata, VoicePromptRegistry
 from .types import (
     AudioChunk,
     AudioFrame,
@@ -32,4 +33,6 @@ __all__ = [
     "SessionClosedError",
     "SessionNotFoundError",
     "SessionState",
+    "VoicePromptMetadata",
+    "VoicePromptRegistry",
 ]

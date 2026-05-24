@@ -20,6 +20,7 @@ from .frame_encoder import pcm16_frame_bytes
 from .scheduler import RealtimeSynthesisScheduler
 from .segmenter import DutchAwarePhraseSegmenter
 from .session import RealtimeTTSSession
+from .voice_registry import VoicePromptRegistry
 from .types import (
     AudioChunk,
     AudioFrame,
@@ -84,6 +85,10 @@ class DiaRealtimeBackend:
         max_audio_seconds: float | None = None,
         max_output_tokens_per_char: float | None = None,
         hard_stop_after_tokens: int | None = None,
+        voice_id: str | None = None,
+        voice_registry_path: str | None = None,
+        audio_prompt_path: str | None = None,
+        audio_prompt_codes: torch.Tensor | None = None,
         collect_timings: bool = False,
         model_load_time_ms: float | None = None,
     ):
@@ -98,11 +103,17 @@ class DiaRealtimeBackend:
         self.max_audio_seconds = max_audio_seconds
         self.max_output_tokens_per_char = max_output_tokens_per_char
         self.hard_stop_after_tokens = hard_stop_after_tokens
+        self.voice_id = voice_id
+        self.voice_registry_path = voice_registry_path
+        self.audio_prompt_path = audio_prompt_path
+        self.audio_prompt_codes = audio_prompt_codes
         self.collect_timings = collect_timings
         self.model_load_time_ms = model_load_time_ms
         self.last_timing_breakdown: dict[str, float | int | list[int] | bool | None] = {}
+        self._resolved_audio_prompt: torch.Tensor | str | None = None
 
     def __call__(self, phrase: RealtimePhrase, config: RealtimeTTSConfig) -> RealtimeSynthesisResult:
+        resolved_audio_prompt = self._resolve_audio_prompt()
         timings: dict[str, float | int | list[int] | bool | None] = {
             "model_load_ms": self.model_load_time_ms,
             "text_encode_ms": None,
@@ -128,6 +139,8 @@ class DiaRealtimeBackend:
             "max_audio_seconds": self.max_audio_seconds,
             "max_output_tokens_per_char": self.max_output_tokens_per_char,
             "hard_stop_after_tokens": self.hard_stop_after_tokens,
+            "voice_id": self.voice_id,
+            "audio_prompt_source": self._describe_audio_prompt_source(resolved_audio_prompt),
         }
 
         with _DiaGenerateProfiler(self.model, timings, enabled=self.collect_timings):
@@ -143,6 +156,7 @@ class DiaRealtimeBackend:
                 max_audio_seconds=self.max_audio_seconds,
                 max_output_tokens_per_char=self.max_output_tokens_per_char,
                 hard_stop_after_tokens=self.hard_stop_after_tokens,
+                audio_prompt=resolved_audio_prompt,
                 verbose=False,
                 stream_callback=None,
             )
@@ -187,6 +201,10 @@ class DiaRealtimeBackend:
         max_audio_seconds: float | None = None,
         max_output_tokens_per_char: float | None = None,
         hard_stop_after_tokens: int | None = None,
+        voice_id: str | None = None,
+        voice_registry_path: str | None = None,
+        audio_prompt_path: str | None = None,
+        audio_prompt_codes: torch.Tensor | None = None,
         collect_timings: bool = False,
     ) -> "DiaRealtimeBackend":
         load_started = perf_counter()
@@ -210,9 +228,50 @@ class DiaRealtimeBackend:
             max_audio_seconds=max_audio_seconds,
             max_output_tokens_per_char=max_output_tokens_per_char,
             hard_stop_after_tokens=hard_stop_after_tokens,
+            voice_id=voice_id,
+            voice_registry_path=voice_registry_path,
+            audio_prompt_path=audio_prompt_path,
+            audio_prompt_codes=audio_prompt_codes,
             collect_timings=collect_timings,
             model_load_time_ms=model_load_time_ms,
         )
+
+    def _resolve_audio_prompt(self) -> torch.Tensor | str | None:
+        if self.audio_prompt_codes is not None:
+            return self.audio_prompt_codes
+
+        if self.voice_id is not None:
+            if self._resolved_audio_prompt is None:
+                registry = VoicePromptRegistry(
+                    self.voice_registry_path
+                    if self.voice_registry_path is not None
+                    else "voice_prompts"
+                )
+                self._resolved_audio_prompt = registry.load_voice_prompt(self.voice_id)
+            return self._resolved_audio_prompt
+
+        if self.audio_prompt_path is not None:
+            prompt_path = Path(self.audio_prompt_path)
+            if prompt_path.suffix == ".pt":
+                if self._resolved_audio_prompt is None:
+                    loaded = torch.load(prompt_path, map_location="cpu")
+                    if not isinstance(loaded, torch.Tensor):
+                        raise TypeError(
+                            f"Audio prompt path did not load a torch.Tensor: {prompt_path}"
+                        )
+                    self._resolved_audio_prompt = loaded
+                return self._resolved_audio_prompt
+            return str(prompt_path)
+
+        return None
+
+    @staticmethod
+    def _describe_audio_prompt_source(audio_prompt: torch.Tensor | str | None) -> str:
+        if isinstance(audio_prompt, torch.Tensor):
+            return "prompt_codes"
+        if isinstance(audio_prompt, str):
+            return "audio_prompt_path"
+        return "none"
 
 
 class _DiaGenerateProfiler:
