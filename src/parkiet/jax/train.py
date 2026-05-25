@@ -192,8 +192,7 @@ def resolve_training_speaker_condition(
     return model.get_speaker_condition(speaker_id)
 
 
-@nnx.jit(static_argnames=("dia_config",))
-def compute_loss(
+def compute_loss_impl(
     model: DiaModel,
     text_tokens: jnp.ndarray,
     audio_input: jnp.ndarray,
@@ -322,6 +321,25 @@ def compute_loss(
     }
 
     return loss, metrics
+
+
+@nnx.jit(static_argnames=("dia_config",))
+def compute_loss(
+    model: DiaModel,
+    text_tokens: jnp.ndarray,
+    audio_input: jnp.ndarray,
+    audio_target: jnp.ndarray,
+    dia_config: DiaConfig,
+    speaker_id: jnp.ndarray | None = None,
+) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
+    return compute_loss_impl(
+        model,
+        text_tokens,
+        audio_input,
+        audio_target,
+        dia_config,
+        speaker_id=speaker_id,
+    )
 
 
 @nnx.jit(static_argnames=("dia_config",))

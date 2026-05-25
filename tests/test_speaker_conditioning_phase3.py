@@ -7,7 +7,7 @@ from parkiet.dia.config import DecoderConfig, DiaConfig, EncoderConfig
 from parkiet.jax.dataset import AudioTextDataset
 from parkiet.jax.train import (
     TrainingConfig as SingleTrainingConfig,
-    compute_loss as compute_loss_single,
+    compute_loss_impl as compute_loss_single_impl,
     load_and_prepare_batch as load_and_prepare_batch_single,
 )
 
@@ -123,7 +123,7 @@ def test_compute_loss_accepts_speaker_id_when_enabled():
     audio_input = jnp.zeros((batch_size, config.decoder_config.max_position_embeddings, config.decoder_config.num_channels), dtype=jnp.int32)
     audio_target = jnp.zeros_like(audio_input)
     speaker_id = jnp.array([1, 2], dtype=jnp.int32)
-    loss, metrics = compute_loss_single(
+    loss, metrics = compute_loss_single_impl(
         model,
         text,
         audio_input,
@@ -145,7 +145,9 @@ def test_missing_speaker_id_raises_only_when_enabled():
     audio_input = jnp.zeros((batch_size, config.decoder_config.max_position_embeddings, config.decoder_config.num_channels), dtype=jnp.int32)
     audio_target = jnp.zeros_like(audio_input)
     try:
-        compute_loss_single(model, text, audio_input, audio_target, config, speaker_id=None)
+        compute_loss_single_impl(
+            model, text, audio_input, audio_target, config, speaker_id=None
+        )
     except ValueError as exc:
         assert "speaker_id is required" in str(exc)
     else:
@@ -153,7 +155,7 @@ def test_missing_speaker_id_raises_only_when_enabled():
 
     config_disabled = _minimal_config(enabled=False)
     model_disabled = _FakeSpeakerAwareModel(config_disabled)
-    loss, metrics = compute_loss_single(
+    loss, metrics = compute_loss_single_impl(
         model_disabled,
         text,
         audio_input,
