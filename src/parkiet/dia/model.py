@@ -144,6 +144,35 @@ class Dia:
         if torch.cuda.is_available():
             torch.backends.cuda.matmul.allow_tf32 = True
 
+    def _resolve_speaker_id_batch(
+        self,
+        batch_size: int,
+        speaker_id: int | list[int] | None,
+    ) -> list[int] | None:
+        if not self.config.speaker_conditioning_enabled:
+            return None
+
+        if self.config.num_speakers <= 0:
+            raise ValueError(
+                "speaker conditioning is enabled but config.num_speakers is not positive"
+            )
+
+        if speaker_id is None:
+            resolved = [self.config.default_speaker_id] * batch_size
+        elif isinstance(speaker_id, list):
+            if len(speaker_id) != batch_size:
+                raise ValueError("Number of speaker IDs must match batch size")
+            resolved = [int(item) for item in speaker_id]
+        else:
+            resolved = [int(speaker_id)] * batch_size
+
+        for item in resolved:
+            if item < 0 or item >= self.config.num_speakers:
+                raise ValueError(
+                    f"speaker_id {item} is out of range for num_speakers={self.config.num_speakers}"
+                )
+        return resolved
+
     @classmethod
     def from_local(
         cls,
@@ -180,6 +209,13 @@ class Dia:
             dia.model.load_state_dict(state_dict)
         except FileNotFoundError:
             raise FileNotFoundError(f"Checkpoint file not found at {checkpoint_path}")
+        except RuntimeError as e:
+            if dia.config.speaker_conditioning_enabled:
+                raise RuntimeError(
+                    "Failed to load speaker-conditioned checkpoint. "
+                    "speaker_conditioning_enabled=True requires a checkpoint with speaker conditioning weights."
+                ) from e
+            raise
         except Exception as e:
             raise RuntimeError(
                 f"Error loading checkpoint from {checkpoint_path}"
@@ -373,6 +409,7 @@ class Dia:
         audio_prompts: list[torch.Tensor | None],
         max_tokens: int | None = None,
         disable_cfg: bool = False,
+        speaker_ids: list[int] | None = None,
         attn_fn: Callable = F.scaled_dot_product_attention,
     ):
         """Initializes the model state for generation.
@@ -409,7 +446,27 @@ class Dia:
             enc_input_cond,
             batch_multiplier=batch_multiplier,
         )
-        encoder_out = self.model.encoder(enc_input, enc_state)
+        encoder_speaker_condition = None
+        decoder_speaker_condition = None
+        if self.config.speaker_conditioning_enabled:
+            if speaker_ids is None:
+                raise ValueError("speaker_ids are required when speaker conditioning is enabled")
+            speaker_ids_tensor = torch.tensor(
+                speaker_ids,
+                dtype=torch.long,
+                device=self.device,
+            )
+            if not disable_cfg:
+                speaker_ids_tensor = speaker_ids_tensor.repeat_interleave(2, dim=0)
+            encoder_speaker_condition, decoder_speaker_condition = self.model.get_speaker_condition(
+                speaker_ids_tensor
+            )
+
+        encoder_out = self.model.encoder(
+            enc_input,
+            enc_state,
+            speaker_condition=encoder_speaker_condition,
+        )
 
         dec_cross_attn_cache = self.model.decoder.precompute_cross_attn_cache(
             encoder_out
@@ -430,12 +487,17 @@ class Dia:
         dec_output.prefill(prefill, prefill_steps)
 
         dec_step = min(prefill_steps) - 1
+        dec_state.speaker_condition = decoder_speaker_condition
         if dec_step > 0:
             dec_state.prepare_step(0, dec_step)
             tokens_BxTxC = dec_output.get_tokens_at(0, dec_step)
             if not disable_cfg:
                 tokens_BxTxC = tokens_BxTxC.repeat_interleave(2, dim=0)
-            self.model.decoder.forward(tokens_BxTxC, dec_state)
+            self.model.decoder.forward(
+                tokens_BxTxC,
+                dec_state,
+                speaker_condition=decoder_speaker_condition,
+            )
 
         return dec_state, dec_output
 
@@ -473,7 +535,10 @@ class Dia:
         """
         audio_eos_value = self.config.eos_token_id
         logits_Bx1xCxV = self.model.decoder.decode_step(
-            tokens_Bx1xC, dec_state, current_idx
+            tokens_Bx1xC,
+            dec_state,
+            current_idx,
+            speaker_condition=getattr(dec_state, "speaker_condition", None),
         )
         if disable_cfg:
             B = tokens_Bx1xC.shape[0]
@@ -687,6 +752,7 @@ class Dia:
         hard_stop_after_tokens: int | None = None,
         trim_audio_prompt_from_output: bool = False,
         audio_prompt_context_frames: int = DEFAULT_PROMPT_TRIM_CONTEXT_FRAMES,
+        speaker_id: int | list[int] | None = None,
         stream_callback = None,
     ) -> np.ndarray | list[np.ndarray]:
         """Generates audio corresponding to the input text.
@@ -712,6 +778,8 @@ class Dia:
             use_cfg_filter: (Deprecated) This parameter is no longer used.
             verbose: If True, prints progress information during generation, including
                      speed metrics.
+            speaker_id: Optional speaker identity input reserved for speaker-conditioned
+                        checkpoints. Ignored when speaker conditioning is disabled.
 
         Returns:
             If a single text prompt was provided, returns a NumPy array containing the
@@ -765,6 +833,7 @@ class Dia:
         assert len(audio_prompt) == batch_size, (
             "Number of audio prompts must match batch size"
         )
+        resolved_speaker_ids = self._resolve_speaker_id_batch(batch_size, speaker_id)
         prompt_code_steps = [
             int(prompt.shape[0]) if isinstance(prompt, torch.Tensor) else 0
             for prompt in audio_prompt
@@ -810,6 +879,7 @@ class Dia:
             audio_prompt,
             max_tokens=effective_max_tokens,
             disable_cfg=disable_cfg,
+            speaker_ids=resolved_speaker_ids,
         )
         dec_step = min(dec_output.prefill_steps) - 1
         current_idx = torch.tensor([dec_step], device=self.device)

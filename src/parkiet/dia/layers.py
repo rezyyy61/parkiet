@@ -649,8 +649,11 @@ class Encoder(nn.Module):
         self,
         x_ids: torch.Tensor,
         state: EncoderInferenceState,
+        speaker_condition: torch.Tensor | None = None,
     ) -> torch.Tensor:
         x = self.embedding(x_ids)
+        if speaker_condition is not None:
+            x = x + speaker_condition[:, None, :].to(x.dtype)
 
         for layer in self.layers:
             x = layer(x, state)
@@ -827,6 +830,7 @@ class Decoder(nn.Module):
         tgt_ids_Bx1xC: torch.Tensor,  # [B, 1, C]
         state: DecoderInferenceState,
         current_idx: int,
+        speaker_condition: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Performs a single decoding step, managing KV caches layer by layer.
@@ -840,6 +844,8 @@ class Decoder(nn.Module):
             channel_tokens = tgt_ids_Bx1xC[..., i]
             channel_embed = self.embeddings[i](channel_tokens)
             x = channel_embed if x is None else x + channel_embed
+        if speaker_condition is not None:
+            x = x + speaker_condition[:, None, :].to(x.dtype)
 
         for i, layer in enumerate(self.layers):
             self_cache = state.self_attn_cache[i]
@@ -858,7 +864,10 @@ class Decoder(nn.Module):
         return logits_Bx1xCxV.to(torch.float32)
 
     def forward(
-        self, tgt_ids_BxTxC: torch.Tensor, state: DecoderInferenceState
+        self,
+        tgt_ids_BxTxC: torch.Tensor,
+        state: DecoderInferenceState,
+        speaker_condition: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Forward pass for the Decoder stack, managing KV caches.
@@ -890,6 +899,8 @@ class Decoder(nn.Module):
             channel_tokens = tgt_ids_BxTxC[..., i]
             channel_embed = self.embeddings[i](channel_tokens)
             x = channel_embed if x is None else x + channel_embed
+        if speaker_condition is not None:
+            x = x + speaker_condition[:, None, :].to(x.dtype)
 
         for i, layer in enumerate(self.layers):
             self_cache = state.self_attn_cache[i]
@@ -927,5 +938,45 @@ class DiaModel(
     def __init__(self, config: DiaConfig, compute_dtype: torch.dtype):
         super().__init__()
         self.config = config
+        if config.speaker_conditioning_enabled and config.num_speakers <= 0:
+            raise ValueError(
+                "speaker conditioning is enabled but config.num_speakers is not positive"
+            )
         self.encoder = Encoder(config, compute_dtype)
         self.decoder = Decoder(config, compute_dtype)
+        self.speaker_embedding: nn.Embedding | None = None
+        self.speaker_to_encoder: nn.Linear | None = None
+        self.speaker_to_decoder: nn.Linear | None = None
+        if config.speaker_conditioning_enabled:
+            self.speaker_embedding = nn.Embedding(
+                config.num_speakers,
+                config.speaker_embedding_dim,
+                dtype=compute_dtype,
+            )
+            self.speaker_to_encoder = nn.Linear(
+                config.speaker_embedding_dim,
+                config.encoder_config.hidden_size,
+                bias=True,
+                dtype=compute_dtype,
+            )
+            self.speaker_to_decoder = nn.Linear(
+                config.speaker_embedding_dim,
+                config.decoder_config.hidden_size,
+                bias=True,
+                dtype=compute_dtype,
+            )
+
+    def get_speaker_condition(
+        self, speaker_ids: torch.Tensor | None
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if not self.config.speaker_conditioning_enabled:
+            return None, None
+        if speaker_ids is None:
+            raise ValueError("speaker_ids are required when speaker conditioning is enabled")
+        if self.speaker_embedding is None or self.speaker_to_encoder is None or self.speaker_to_decoder is None:
+            raise RuntimeError("speaker conditioning modules are not initialized")
+        speaker_ids = speaker_ids.to(dtype=torch.long, device=self.speaker_embedding.weight.device)
+        speaker_embedding = self.speaker_embedding(speaker_ids)
+        encoder_speaker_bias = self.speaker_to_encoder(speaker_embedding)
+        decoder_speaker_bias = self.speaker_to_decoder(speaker_embedding)
+        return encoder_speaker_bias, decoder_speaker_bias

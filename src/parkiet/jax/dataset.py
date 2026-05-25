@@ -4,6 +4,7 @@ from pathlib import Path
 import logging
 from collections.abc import Iterator
 from parkiet.dia.config import DiaConfig
+from parkiet.speaker_vocab import load_speaker_vocab, map_chunk_owner_to_speaker_id
 
 log = logging.getLogger(__name__)
 
@@ -19,6 +20,7 @@ class AudioTextDataset:
         max_text_length: int | None = None,
         transcription_clean_prob: float = 0.1,
         text_dropout_prob: float = 0.15,
+        speaker_vocab: dict | str | Path | None = None,
     ):
         """
         Initialize the dataset.
@@ -40,6 +42,10 @@ class AudioTextDataset:
         )
         self.transcription_clean_prob = transcription_clean_prob
         self.text_dropout_prob = text_dropout_prob
+        if isinstance(speaker_vocab, (str, Path)):
+            self.speaker_vocab = load_speaker_vocab(speaker_vocab)
+        else:
+            self.speaker_vocab = speaker_vocab
         self.rng = np.random.RandomState(42)
 
         # Load all parquet files
@@ -109,11 +115,22 @@ class AudioTextDataset:
         # Get class-balanced weight if available, default to 1.0
         cb_weight = row.get("cb_weight", 1.0)
 
-        return {
+        sample = {
             "text": text_tokens,
             "audio": audio_tokens,
             "cb_weight": np.float32(cb_weight),
         }
+        if self.speaker_vocab is not None:
+            chunk_owner = row.get("chunk_owner", None)
+            speaker_id = map_chunk_owner_to_speaker_id(
+                int(chunk_owner) if pd.notna(chunk_owner) else None,
+                self.speaker_vocab,
+                default_speaker_id=int(
+                    self.speaker_vocab.get("default_speaker_id", 0)
+                ),
+            )
+            sample["speaker_id"] = np.int32(speaker_id)
+        return sample
 
     def _encode_text(self, text: str) -> np.ndarray:
         """
@@ -384,6 +401,7 @@ def create_dataset(
     max_text_length: int | None = None,
     transcription_clean_prob: float = 0.1,
     text_dropout_prob: float = 0.15,
+    speaker_vocab: dict | str | Path | None = None,
 ) -> AudioTextDataset:
     """
     Create an AudioTextDataset for training.
@@ -406,4 +424,5 @@ def create_dataset(
         max_text_length=max_text_length,
         transcription_clean_prob=transcription_clean_prob,
         text_dropout_prob=text_dropout_prob,
+        speaker_vocab=speaker_vocab,
     )
