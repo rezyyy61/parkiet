@@ -125,6 +125,39 @@ def cleanup_torch_memory(device: torch.device | None) -> None:
             torch.cuda.reset_peak_memory_stats(device)
 
 
+def set_eval_mode(model: Dia) -> None:
+    if hasattr(model, "model") and hasattr(model.model, "eval"):
+        model.model.eval()
+    if hasattr(model, "eval"):
+        model.eval()
+
+
+def memory_snapshot(device: torch.device | None) -> dict[str, float] | None:
+    if not (isinstance(device, torch.device) and device.type == "cuda" and torch.cuda.is_available()):
+        return None
+    allocated = torch.cuda.memory_allocated(device) / (1024**3)
+    reserved = torch.cuda.memory_reserved(device) / (1024**3)
+    max_allocated = torch.cuda.max_memory_allocated(device) / (1024**3)
+    return {
+        "allocated_gb": float(allocated),
+        "reserved_gb": float(reserved),
+        "max_allocated_gb": float(max_allocated),
+    }
+
+
+def log_memory(label: str, device: torch.device | None, logs: list[dict[str, Any]]) -> None:
+    snapshot = memory_snapshot(device)
+    if snapshot is None:
+        return
+    record = {"label": label, **snapshot}
+    logs.append(record)
+    print(
+        f"  memory[{label}] allocated={snapshot['allocated_gb']:.2f}GB "
+        f"reserved={snapshot['reserved_gb']:.2f}GB "
+        f"max_allocated={snapshot['max_allocated_gb']:.2f}GB"
+    )
+
+
 def run_direct_case(
     model: Dia,
     *,
@@ -175,149 +208,172 @@ def manual_old_streamer_style_case(
     context_frames: int,
     output_dir: Path,
 ) -> dict[str, Any]:
+    set_eval_mode(model)
     if args.use_torch_compile:
         maybe_compile_model(model)
 
-    text_tokens = [model._encode_text(full_text)]
-    text_tensor = model._pad_text_input(text_tokens)
-    prefill_preview, prefill_steps_preview = model._prepare_audio_prompt([prompt_codes])
+    memory_logs: list[dict[str, Any]] = []
+    log_memory("before_generation", getattr(model, "device", None), memory_logs)
 
-    effective_max_tokens = args.max_tokens
-    dec_state, dec_output = model._prepare_generation(
-        text_tensor,
-        [prompt_codes],
-        max_tokens=effective_max_tokens,
-    )
-    prefill_step = dec_output.prefill_steps[0]
-    dec_step = min(dec_output.prefill_steps) - 1
-    current_idx = torch.tensor([dec_step], device=model.device)
+    with torch.inference_mode():
+        text_tokens = [model._encode_text(full_text)]
+        text_tensor = model._pad_text_input(text_tokens)
+        prefill_preview, prefill_steps_preview = model._prepare_audio_prompt([prompt_codes])
 
-    audio_eos_value = model.config.eos_token_id
-    audio_pad_value = model.config.pad_token_id
-    delay_pattern = model.config.delay_pattern
-    max_delay_pattern = max(delay_pattern)
-    delay_pattern_Cx = torch.tensor(delay_pattern, device=model.device, dtype=torch.long)
-
-    eos_detected_Bx = torch.zeros((1,), dtype=torch.bool, device=model.device)
-    eos_countdown_Bx = torch.full((1,), -1, dtype=torch.long, device=model.device)
-    finished_step_Bx = torch.full((1,), -1, dtype=torch.long, device=model.device)
-    bos_over = False
-
-    while dec_step < effective_max_tokens:
-        if (eos_countdown_Bx == 0).all():
-            break
-
-        current_step_idx = dec_step + 1
-        torch.compiler.cudagraph_mark_step_begin()
-        dec_state.prepare_step(dec_step)
-        tokens_Bx1xC = dec_output.get_tokens_at(dec_step).repeat_interleave(2, dim=0)
-
-        pred_BxC = model._decoder_step(
-            tokens_Bx1xC,
-            dec_state,
-            args.cfg_scale,
-            args.temperature,
-            args.top_p,
-            args.cfg_filter_top_k,
-            current_idx,
+        effective_max_tokens = args.max_tokens
+        dec_state, dec_output = model._prepare_generation(
+            text_tensor,
+            [prompt_codes],
+            max_tokens=effective_max_tokens,
         )
-        current_idx += 1
+        log_memory("after_prepare_generation", getattr(model, "device", None), memory_logs)
+        prefill_step = dec_output.prefill_steps[0]
+        dec_step = min(dec_output.prefill_steps) - 1
+        current_idx = torch.tensor([dec_step], device=model.device)
 
-        active_mask_Bx = eos_countdown_Bx != 0
-        eos_trigger_Bx = torch.zeros_like(active_mask_Bx)
-        if active_mask_Bx.any():
-            is_eos_token = (~eos_detected_Bx[active_mask_Bx]) & (
-                pred_BxC[active_mask_Bx, 0] == audio_eos_value
-            )
-            is_max_len = current_step_idx >= effective_max_tokens - max_delay_pattern
-            eos_trigger_Bx[active_mask_Bx] = is_eos_token | is_max_len
+        audio_eos_value = model.config.eos_token_id
+        audio_pad_value = model.config.pad_token_id
+        delay_pattern = model.config.delay_pattern
+        max_delay_pattern = max(delay_pattern)
+        delay_pattern_Cx = torch.tensor(
+            delay_pattern,
+            device=model.device,
+            dtype=torch.long,
+        )
 
-        eos_detected_Bx |= eos_trigger_Bx
-        start_countdown_mask_Bx = eos_trigger_Bx & (eos_countdown_Bx < 0)
-        if start_countdown_mask_Bx.any():
-            eos_countdown_Bx[start_countdown_mask_Bx] = max_delay_pattern
-            finished_step_Bx[start_countdown_mask_Bx] = current_step_idx
+        eos_detected_Bx = torch.zeros((1,), dtype=torch.bool, device=model.device)
+        eos_countdown_Bx = torch.full((1,), -1, dtype=torch.long, device=model.device)
+        finished_step_Bx = torch.full((1,), -1, dtype=torch.long, device=model.device)
+        bos_over = False
 
-        padding_mask_Bx = eos_countdown_Bx > 0
-        if padding_mask_Bx.any():
-            pred_active_BxC = pred_BxC[padding_mask_Bx].clone()
-            countdown_active_Bx = eos_countdown_Bx[padding_mask_Bx]
-            step_after_eos_Bx = max_delay_pattern - countdown_active_Bx
-            step_after_eos_Bx_ = step_after_eos_Bx.unsqueeze(1)
-            delay_pattern_Cx_ = delay_pattern_Cx.unsqueeze(0)
-            eos_mask_NxC = step_after_eos_Bx_ == delay_pattern_Cx_
-            pad_mask_NxC = step_after_eos_Bx_ > delay_pattern_Cx_
-            pred_active_BxC[eos_mask_NxC] = audio_eos_value
-            pred_active_BxC[pad_mask_NxC] = audio_pad_value
-            pred_BxC[padding_mask_Bx] = pred_active_BxC
-            eos_countdown_Bx[padding_mask_Bx] -= 1
+        while dec_step < effective_max_tokens:
+            if (eos_countdown_Bx == 0).all():
+                break
 
-        if not bos_over:
-            bos_over = all(
-                dec_step - current_prefill_step > max_delay_pattern
-                for current_prefill_step in dec_output.prefill_steps
-            )
+            current_step_idx = dec_step + 1
+            torch.compiler.cudagraph_mark_step_begin()
+            dec_state.prepare_step(dec_step)
+            tokens_Bx1xC = dec_output.get_tokens_at(dec_step).repeat_interleave(2, dim=0)
 
-        dec_output.update_one(pred_BxC, current_step_idx, not bos_over)
-        dec_step += 1
+            pred_BxC = model._decoder_step(
+                tokens_Bx1xC,
+                dec_state,
+                args.cfg_scale,
+                args.temperature,
+                args.top_p,
+                args.cfg_filter_top_k,
+                current_idx,
+            ).detach()
+            current_idx += 1
 
-    final_step = dec_step + 1
-    finished_step_Bx[finished_step_Bx == -1] = final_step - max_delay_pattern
-    generated_token_count = int(torch.clamp(finished_step_Bx[0] - prefill_step, min=0).item())
+            active_mask_Bx = eos_countdown_Bx != 0
+            eos_trigger_Bx = torch.zeros_like(active_mask_Bx)
+            if active_mask_Bx.any():
+                is_eos_token = (~eos_detected_Bx[active_mask_Bx]) & (
+                    pred_BxC[active_mask_Bx, 0] == audio_eos_value
+                )
+                is_max_len = current_step_idx >= effective_max_tokens - max_delay_pattern
+                eos_trigger_Bx[active_mask_Bx] = is_eos_token | is_max_len
 
-    # Method 1: decode generated slice only.
-    generated_codes_len = generated_token_count + max_delay_pattern
-    generated_codes = torch.full(
-        (1, generated_codes_len, model.config.decoder_config.num_channels),
-        fill_value=model.config.pad_token_id,
-        dtype=torch.long,
-        device=model.device,
-    )
-    if generated_codes_len > 0:
-        generated_codes[0, :generated_codes_len, :] = dec_output.generated_tokens[
-            0,
-            prefill_step : prefill_step + generated_codes_len,
+            eos_detected_Bx |= eos_trigger_Bx
+            start_countdown_mask_Bx = eos_trigger_Bx & (eos_countdown_Bx < 0)
+            if start_countdown_mask_Bx.any():
+                eos_countdown_Bx[start_countdown_mask_Bx] = max_delay_pattern
+                finished_step_Bx[start_countdown_mask_Bx] = current_step_idx
+
+            padding_mask_Bx = eos_countdown_Bx > 0
+            if padding_mask_Bx.any():
+                pred_active_BxC = pred_BxC[padding_mask_Bx].clone()
+                countdown_active_Bx = eos_countdown_Bx[padding_mask_Bx]
+                step_after_eos_Bx = max_delay_pattern - countdown_active_Bx
+                step_after_eos_Bx_ = step_after_eos_Bx.unsqueeze(1)
+                delay_pattern_Cx_ = delay_pattern_Cx.unsqueeze(0)
+                eos_mask_NxC = step_after_eos_Bx_ == delay_pattern_Cx_
+                pad_mask_NxC = step_after_eos_Bx_ > delay_pattern_Cx_
+                pred_active_BxC[eos_mask_NxC] = audio_eos_value
+                pred_active_BxC[pad_mask_NxC] = audio_pad_value
+                pred_BxC[padding_mask_Bx] = pred_active_BxC
+                eos_countdown_Bx[padding_mask_Bx] -= 1
+
+            if not bos_over:
+                bos_over = all(
+                    dec_step - current_prefill_step > max_delay_pattern
+                    for current_prefill_step in dec_output.prefill_steps
+                )
+
+            dec_output.update_one(pred_BxC, current_step_idx, not bos_over)
+            dec_step += 1
+
+            if dec_step % 50 == 0:
+                log_memory(
+                    f"decoder_step_{dec_step}",
+                    getattr(model, "device", None),
+                    memory_logs,
+                )
+
+        final_step = dec_step + 1
+        finished_step_Bx[finished_step_Bx == -1] = final_step - max_delay_pattern
+        generated_token_count = int(
+            torch.clamp(finished_step_Bx[0] - prefill_step, min=0).item()
+        )
+
+        log_memory("before_decode", getattr(model, "device", None), memory_logs)
+
+        # Method 1: decode generated slice only.
+        generated_codes_len = generated_token_count + max_delay_pattern
+        generated_codes = torch.full(
+            (1, generated_codes_len, model.config.decoder_config.num_channels),
+            fill_value=model.config.pad_token_id,
+            dtype=torch.long,
+            device=model.device,
+        )
+        if generated_codes_len > 0:
+            generated_codes[0, :generated_codes_len, :] = dec_output.generated_tokens[
+                0,
+                prefill_step : prefill_step + generated_codes_len,
+                :,
+            ]
+        direct_audio = model._generate_output(
+            generated_codes,
+            torch.tensor([generated_token_count], dtype=torch.long, device=model.device),
+        )[0]
+
+        # Method 2: decode from prefill start and trim full prompt waveform.
+        full_prefill_valid_frames = prefill_step + generated_token_count
+        full_prefill_delayed_frames = full_prefill_valid_frames + max_delay_pattern
+        full_prefill_codes = dec_output.generated_tokens[
+            0:1,
+            0:full_prefill_delayed_frames,
             :,
         ]
-    direct_audio = model._generate_output(
-        generated_codes,
-        torch.tensor([generated_token_count], dtype=torch.long, device=model.device),
-    )[0]
+        full_prefill_audio = model._generate_output(
+            full_prefill_codes,
+            torch.tensor([full_prefill_valid_frames], dtype=torch.long, device=model.device),
+        )[0]
+        waveform_trim_samples = prefill_step * SAMPLE_RATE_RATIO
+        full_prefill_trimmed_audio = full_prefill_audio[
+            waveform_trim_samples : waveform_trim_samples
+            + generated_token_count * SAMPLE_RATE_RATIO
+        ]
 
-    # Method 2: decode from prefill start and trim full prompt waveform.
-    full_prefill_valid_frames = prefill_step + generated_token_count
-    full_prefill_delayed_frames = full_prefill_valid_frames + max_delay_pattern
-    full_prefill_codes = dec_output.generated_tokens[
-        0:1,
-        0 : full_prefill_delayed_frames,
-        :,
-    ]
-    full_prefill_audio = model._generate_output(
-        full_prefill_codes,
-        torch.tensor([full_prefill_valid_frames], dtype=torch.long, device=model.device),
-    )[0]
-    waveform_trim_samples = prefill_step * SAMPLE_RATE_RATIO
-    full_prefill_trimmed_audio = full_prefill_audio[
-        waveform_trim_samples : waveform_trim_samples + generated_token_count * SAMPLE_RATE_RATIO
-    ]
-
-    # Method 3: old streamer-style context decode and trim context waveform.
-    decode_start = max(0, prefill_step - context_frames)
-    actual_prompt_context_frames = prefill_step - decode_start
-    total_valid_frames = actual_prompt_context_frames + generated_token_count
-    total_delayed_frames = total_valid_frames + max_delay_pattern
-    delayed_codes = dec_output.generated_tokens[
-        0:1,
-        decode_start : decode_start + total_delayed_frames,
-        :,
-    ]
-    context_audio = model._generate_output(
-        delayed_codes,
-        torch.tensor([total_valid_frames], dtype=torch.long, device=model.device),
-    )[0]
-    context_trim_samples = actual_prompt_context_frames * SAMPLE_RATE_RATIO
-    context_end_sample = context_trim_samples + generated_token_count * SAMPLE_RATE_RATIO
-    continuation_audio = context_audio[context_trim_samples:context_end_sample]
+        # Method 3: old streamer-style context decode and trim context waveform.
+        decode_start = max(0, prefill_step - context_frames)
+        actual_prompt_context_frames = prefill_step - decode_start
+        total_valid_frames = actual_prompt_context_frames + generated_token_count
+        total_delayed_frames = total_valid_frames + max_delay_pattern
+        delayed_codes = dec_output.generated_tokens[
+            0:1,
+            decode_start : decode_start + total_delayed_frames,
+            :,
+        ]
+        context_audio = model._generate_output(
+            delayed_codes,
+            torch.tensor([total_valid_frames], dtype=torch.long, device=model.device),
+        )[0]
+        context_trim_samples = actual_prompt_context_frames * SAMPLE_RATE_RATIO
+        context_end_sample = context_trim_samples + generated_token_count * SAMPLE_RATE_RATIO
+        continuation_audio = context_audio[context_trim_samples:context_end_sample]
+        log_memory("after_decode", getattr(model, "device", None), memory_logs)
 
     wav_path = output_dir / f"{case_name}.wav"
     write_audio(wav_path, continuation_audio)
@@ -343,6 +399,7 @@ def manual_old_streamer_style_case(
         "output_samples_after_trim": int(len(continuation_audio)),
         "context_frames_requested": int(context_frames),
         "context_frames_used": int(actual_prompt_context_frames),
+        "memory_logs": memory_logs,
         "audio_stats": audio_stats(continuation_audio),
         "comparison": {
             "method_decode_generated_slice_only": {
@@ -362,6 +419,20 @@ def manual_old_streamer_style_case(
         },
     }
     print_case_metadata(metadata)
+    del text_tokens
+    del text_tensor
+    del prefill_preview
+    del dec_state
+    del dec_output
+    del current_idx
+    del eos_detected_Bx
+    del eos_countdown_Bx
+    del finished_step_Bx
+    del delay_pattern_Cx
+    del generated_codes
+    del full_prefill_codes
+    del delayed_codes
+    cleanup_torch_memory(getattr(model, "device", None))
     return metadata
 
 
