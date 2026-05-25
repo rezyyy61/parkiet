@@ -43,9 +43,9 @@ def _minimal_config(enabled: bool = False, num_speakers: int = 0) -> DiaConfig:
             cross_num_key_value_heads=2,
             cross_head_dim=8,
             max_position_embeddings=32,
-            num_channels=2,
+            num_channels=9,
         ),
-        delay_pattern=(0, 1),
+        delay_pattern=(0, 8, 9, 10, 11, 12, 13, 14, 15),
         speaker_conditioning_enabled=enabled,
         num_speakers=num_speakers,
     )
@@ -315,7 +315,7 @@ def test_decoder_decode_step_accepts_speaker_condition():
     logits = model.decoder.decode_step(
         tgt_ids,
         dec_state,
-        current_idx=0,
+        current_idx=torch.tensor([0], dtype=torch.long),
         speaker_condition=decoder_bias,
     )
     assert logits.shape == (
