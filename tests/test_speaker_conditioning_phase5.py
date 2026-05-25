@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from parkiet.dia.config import DecoderConfig, DiaConfig, EncoderConfig
@@ -129,3 +130,19 @@ def test_speaker_vocab_maps_source_speaker_1_to_model_speaker_1(tmp_path: Path):
     vocab_path.write_text(json.dumps(_speaker_vocab()), encoding="utf-8")
     loaded = json.loads(vocab_path.read_text(encoding="utf-8"))
     assert loaded["source_speaker_id_to_model_speaker_id"]["1"] == 1
+
+
+def test_source_speaker_schema_loads_and_maps_string_and_numpy_ids(tmp_path: Path):
+    from parkiet.speaker_vocab import load_speaker_vocab, map_chunk_owner_to_speaker_id
+
+    vocab_path = tmp_path / "speaker_vocab.json"
+    vocab_path.write_text(json.dumps(_speaker_vocab()), encoding="utf-8")
+    vocab = load_speaker_vocab(vocab_path)
+    assert map_chunk_owner_to_speaker_id(1, vocab, default_speaker_id=0) == 1
+    assert map_chunk_owner_to_speaker_id("1", vocab, default_speaker_id=0) == 1
+    assert map_chunk_owner_to_speaker_id(np.int64(1), vocab, default_speaker_id=0) == 1
+    assert map_chunk_owner_to_speaker_id(0, vocab, default_speaker_id=0) == 0
+    assert map_chunk_owner_to_speaker_id("0", vocab, default_speaker_id=0) == 0
+    assert map_chunk_owner_to_speaker_id(999, vocab, default_speaker_id=0) == 0
+    assert map_chunk_owner_to_speaker_id(None, vocab, default_speaker_id=0) == 0
+    assert map_chunk_owner_to_speaker_id(-1, vocab, default_speaker_id=0) == 0

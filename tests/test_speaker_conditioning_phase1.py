@@ -118,9 +118,32 @@ def test_speaker_vocab_mapping_roundtrip(tmp_path: Path):
     loaded = load_speaker_vocab(vocab_path)
     assert loaded == vocab
     assert map_chunk_owner_to_speaker_id(17, loaded) == 1
+    assert map_chunk_owner_to_speaker_id("17", loaded) == 1
+    assert map_chunk_owner_to_speaker_id(np.int64(17), loaded) == 1
     assert map_chunk_owner_to_speaker_id(42, loaded) == 2
     assert map_chunk_owner_to_speaker_id(99, loaded) == 0
+    assert map_chunk_owner_to_speaker_id("99", loaded) == 0
     assert map_chunk_owner_to_speaker_id(None, loaded) == 0
+    assert map_chunk_owner_to_speaker_id(-1, loaded) == 0
+    assert map_chunk_owner_to_speaker_id("-1", loaded) == 0
+
+
+def test_load_speaker_vocab_supports_source_speaker_id_schema(tmp_path: Path):
+    vocab_path = tmp_path / "speaker_vocab.json"
+    vocab_path.write_text(
+        json.dumps(
+            {
+                "speaker_vocab_version": "v1",
+                "default_speaker_id": 0,
+                "source_speaker_id_to_model_speaker_id": {"1": 1},
+            }
+        ),
+        encoding="utf-8",
+    )
+    loaded = load_speaker_vocab(vocab_path)
+    assert loaded["default_speaker_id"] == 0
+    assert loaded["db_speaker_id_to_model_speaker_id"] == {"1": 1}
+    assert map_chunk_owner_to_speaker_id("1", loaded) == 1
 
 
 def test_dataset_without_speaker_vocab_behaves_as_before(monkeypatch):

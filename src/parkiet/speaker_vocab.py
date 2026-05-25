@@ -61,11 +61,24 @@ def build_speaker_vocab_from_chunk_owners(
 
 
 def map_chunk_owner_to_speaker_id(
-    chunk_owner: int | None,
+    chunk_owner: int | str | None,
     vocab: dict[str, Any],
     default_speaker_id: int = 0,
 ) -> int:
-    if chunk_owner is None or chunk_owner < 0:
+    if chunk_owner is None:
+        return int(default_speaker_id)
+    try:
+        numeric_owner = int(chunk_owner)
+    except (TypeError, ValueError):
+        numeric_owner = None
+    if numeric_owner is not None and numeric_owner < 0:
         return int(default_speaker_id)
     mapping = vocab.get("db_speaker_id_to_model_speaker_id", {})
-    return int(mapping.get(str(chunk_owner), default_speaker_id))
+    lookup_keys: list[str] = []
+    if numeric_owner is not None:
+        lookup_keys.append(str(numeric_owner))
+    lookup_keys.append(str(chunk_owner))
+    for key in lookup_keys:
+        if key in mapping:
+            return int(mapping[key])
+    return int(default_speaker_id)
