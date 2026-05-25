@@ -13,6 +13,7 @@ from scripts.create_speaker_conditioned_config import (
     build_speaker_conditioned_config,
     derive_num_speakers,
 )
+from scripts.tiny_speaker_finetune_smoke import summarize_rows_mapped_speaker_ids
 
 
 def _base_config() -> DiaConfig:
@@ -146,3 +147,33 @@ def test_source_speaker_schema_loads_and_maps_string_and_numpy_ids(tmp_path: Pat
     assert map_chunk_owner_to_speaker_id(999, vocab, default_speaker_id=0) == 0
     assert map_chunk_owner_to_speaker_id(None, vocab, default_speaker_id=0) == 0
     assert map_chunk_owner_to_speaker_id(-1, vocab, default_speaker_id=0) == 0
+
+
+def test_smoke_reporting_maps_numpy_chunk_owner_to_model_speaker_id():
+    summary = summarize_rows_mapped_speaker_ids(
+        [{"chunk_owner": np.int64(1)}],
+        {
+            "default_speaker_id": 0,
+            "db_speaker_id_to_model_speaker_id": {"1": 1},
+        },
+    )
+    assert summary["speaker_id_unique"] == [1]
+
+
+def test_smoke_reporting_falls_back_to_default_speaker_id():
+    speaker_vocab = {
+        "default_speaker_id": 0,
+        "db_speaker_id_to_model_speaker_id": {"1": 1},
+    }
+    assert summarize_rows_mapped_speaker_ids(
+        [{}],
+        speaker_vocab,
+    )["speaker_id_unique"] == [0]
+    assert summarize_rows_mapped_speaker_ids(
+        [{"chunk_owner": None}],
+        speaker_vocab,
+    )["speaker_id_unique"] == [0]
+    assert summarize_rows_mapped_speaker_ids(
+        [{"chunk_owner": 999}],
+        speaker_vocab,
+    )["speaker_id_unique"] == [0]
