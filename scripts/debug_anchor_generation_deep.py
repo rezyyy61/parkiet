@@ -197,10 +197,15 @@ def run_direct_case(
     audio_np = np.asarray(audio, dtype=np.float32).reshape(-1)
     wav_path = output_dir / f"{case_name}.wav"
     write_audio(wav_path, audio_np)
+    stats = audio_stats(audio_np)
     metadata = {
+        "name": case_name,
         "case_name": case_name,
         "wav_path": str(wav_path),
-        "audio_stats": audio_stats(audio_np),
+        "audio_stats": stats,
+        "min": stats["min"],
+        "max": stats["max"],
+        "rms": stats["rms"],
         "last_generate_metadata": dict(model.last_generate_metadata),
         "audio_prompt_shape": list(audio_prompt.shape)
         if isinstance(audio_prompt, torch.Tensor)
@@ -392,8 +397,10 @@ def manual_old_streamer_style_case(
 
     wav_path = output_dir / f"{case_name}.wav"
     write_audio(wav_path, continuation_audio)
+    stats = audio_stats(continuation_audio)
 
     metadata = {
+        "name": case_name,
         "case_name": case_name,
         "wav_path": str(wav_path),
         "audio_prompt_shape": list(prompt_codes.shape),
@@ -420,7 +427,10 @@ def manual_old_streamer_style_case(
         "context_frames_requested": int(context_frames),
         "context_frames_used": int(actual_prompt_context_frames),
         "memory_logs": memory_logs,
-        "audio_stats": audio_stats(continuation_audio),
+        "audio_stats": stats,
+        "min": stats["min"],
+        "max": stats["max"],
+        "rms": stats["rms"],
         "comparison": {
             "method_decode_generated_slice_only": {
                 "samples": int(len(direct_audio)),
