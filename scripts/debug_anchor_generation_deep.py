@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,16 @@ DEFAULT_REFERENCE_WAV = "debug_reference_voice/nl_test_reference_3s.wav"
 DEFAULT_PROMPT_TRANSCRIPT = "[S1] Goedemiddag, u spreekt met de assistent van de salon."
 DEFAULT_CONTINUATION_TEXT = "[S1] Natuurlijk, ik kan een afspraak voor u inplannen."
 STREAMER_CONTEXTS = [32, 64, 128, 256]
+ALLOWED_CASES = {
+    "all",
+    "A_no_prompt",
+    "B_prompt_path_current",
+    "C_prompt_codes_current",
+    "D_context_32",
+    "D_context_64",
+    "D_context_128",
+    "D_context_256",
+}
 
 
 def parse_bool(value: str) -> bool:
@@ -42,6 +53,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--reference-wav", default=DEFAULT_REFERENCE_WAV)
     parser.add_argument("--prompt-transcript", default=DEFAULT_PROMPT_TRANSCRIPT)
     parser.add_argument("--continuation-text", default=DEFAULT_CONTINUATION_TEXT)
+    parser.add_argument("--case", choices=sorted(ALLOWED_CASES), default="all")
     parser.add_argument("--output-dir", default="debug_anchor_generation_deep")
     parser.add_argument("--use-torch-compile", type=parse_bool, default=False)
     parser.add_argument("--cfg-scale", type=float, default=3.0)
@@ -103,6 +115,14 @@ def maybe_compile_model(model: Dia) -> None:
             mode="max-autotune",
         )
         model._compiled = True
+
+
+def cleanup_torch_memory(device: torch.device | None) -> None:
+    gc.collect()
+    if isinstance(device, torch.device) and device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        if hasattr(torch.cuda, "reset_peak_memory_stats"):
+            torch.cuda.reset_peak_memory_stats(device)
 
 
 def run_direct_case(
@@ -402,50 +422,6 @@ def main(argv: list[str] | None = None) -> int:
     prompt_codes = model.load_audio(str(reference_wav))
     full_text = build_full_text(args.prompt_transcript, args.continuation_text)
 
-    cases: list[dict[str, Any]] = []
-    cases.append(
-        run_direct_case(
-            model,
-            case_name="A_no_prompt",
-            text=args.continuation_text,
-            audio_prompt=None,
-            args=args,
-            output_dir=output_dir,
-        )
-    )
-    cases.append(
-        run_direct_case(
-            model,
-            case_name="B_prompt_path_current",
-            text=full_text,
-            audio_prompt=str(reference_wav),
-            args=args,
-            output_dir=output_dir,
-        )
-    )
-    cases.append(
-        run_direct_case(
-            model,
-            case_name="C_prompt_codes_current",
-            text=full_text,
-            audio_prompt=prompt_codes,
-            args=args,
-            output_dir=output_dir,
-        )
-    )
-    for context_frames in STREAMER_CONTEXTS:
-        cases.append(
-            manual_old_streamer_style_case(
-                model,
-                case_name=f"D_streamer_style_context_{context_frames}",
-                full_text=full_text,
-                prompt_codes=prompt_codes,
-                args=args,
-                context_frames=context_frames,
-                output_dir=output_dir,
-            )
-        )
-
     metadata = {
         "args": vars(args),
         "reference_wav": str(reference_wav),
@@ -454,10 +430,73 @@ def main(argv: list[str] | None = None) -> int:
         "prompt_codes_shape": list(prompt_codes.shape),
         "prompt_codes_dtype": str(prompt_codes.dtype),
         "default_prompt_context_frames": DEFAULT_PROMPT_TRIM_CONTEXT_FRAMES,
-        "cases": cases,
+        "cases": [],
     }
     metadata_path = output_dir / "metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+    requested_cases: list[str]
+    if args.case == "all":
+        requested_cases = [
+            "A_no_prompt",
+            "B_prompt_path_current",
+            "C_prompt_codes_current",
+            "D_context_32",
+            "D_context_64",
+            "D_context_128",
+            "D_context_256",
+        ]
+    else:
+        requested_cases = [args.case]
+
+    try:
+        for requested_case in requested_cases:
+            if requested_case == "A_no_prompt":
+                case_result = run_direct_case(
+                    model,
+                    case_name="A_no_prompt",
+                    text=args.continuation_text,
+                    audio_prompt=None,
+                    args=args,
+                    output_dir=output_dir,
+                )
+            elif requested_case == "B_prompt_path_current":
+                case_result = run_direct_case(
+                    model,
+                    case_name="B_prompt_path_current",
+                    text=full_text,
+                    audio_prompt=str(reference_wav),
+                    args=args,
+                    output_dir=output_dir,
+                )
+            elif requested_case == "C_prompt_codes_current":
+                case_result = run_direct_case(
+                    model,
+                    case_name="C_prompt_codes_current",
+                    text=full_text,
+                    audio_prompt=prompt_codes,
+                    args=args,
+                    output_dir=output_dir,
+                )
+            else:
+                context_frames = int(requested_case.rsplit("_", 1)[-1])
+                case_result = manual_old_streamer_style_case(
+                    model,
+                    case_name=f"D_streamer_style_context_{context_frames}",
+                    full_text=full_text,
+                    prompt_codes=prompt_codes,
+                    args=args,
+                    context_frames=context_frames,
+                    output_dir=output_dir,
+                )
+
+            metadata["cases"].append(case_result)
+            metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+            cleanup_torch_memory(getattr(model, "device", None))
+    finally:
+        del prompt_codes
+        cleanup_torch_memory(getattr(model, "device", None))
+
     print(f"metadata_path={metadata_path}")
     return 0
 
