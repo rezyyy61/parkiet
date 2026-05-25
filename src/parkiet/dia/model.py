@@ -21,6 +21,7 @@ from .state import DecoderInferenceState, DecoderOutput, EncoderInferenceState
 
 DEFAULT_SAMPLE_RATE = 44100
 SAMPLE_RATE_RATIO = 512
+DEFAULT_PROMPT_TRIM_CONTEXT_FRAMES = 128
 
 
 def _get_default_device():
@@ -684,6 +685,7 @@ class Dia:
         max_audio_seconds: float | None = None,
         max_output_tokens_per_char: float | None = None,
         hard_stop_after_tokens: int | None = None,
+        trim_audio_prompt_from_output: bool = False,
         stream_callback = None,
     ) -> np.ndarray | list[np.ndarray]:
         """Generates audio corresponding to the input text.
@@ -762,6 +764,14 @@ class Dia:
         assert len(audio_prompt) == batch_size, (
             "Number of audio prompts must match batch size"
         )
+        prompt_code_steps = [
+            int(prompt.shape[0]) if isinstance(prompt, torch.Tensor) else 0
+            for prompt in audio_prompt
+        ]
+        prompt_duration_ms = [
+            float(step) * SAMPLE_RATE_RATIO / DEFAULT_SAMPLE_RATE * 1000.0
+            for step in prompt_code_steps
+        ]
 
         if isinstance(text, list):
             text_inputs = text
@@ -1026,7 +1036,65 @@ class Dia:
 
             del dec_state
 
-            outputs = self._generate_output(generated_codes, lengths_Bx)
+            if trim_audio_prompt_from_output and any(prompt_code_steps):
+                outputs = []
+                trimmed_samples: list[int] = []
+                prompt_context_frames_per_item: list[int] = []
+                output_duration_before_trim_ms: list[float] = []
+                output_duration_after_trim_ms: list[float] = []
+
+                for i in range(batch_size):
+                    prefill_step = dec_output.prefill_steps[i]
+                    prompt_context_frames = min(
+                        max(0, prefill_step),
+                        DEFAULT_PROMPT_TRIM_CONTEXT_FRAMES,
+                    )
+                    prompt_context_frames_per_item.append(prompt_context_frames)
+
+                    decode_start = max(0, prefill_step - prompt_context_frames)
+                    total_valid_frames = prompt_context_frames + lengths_Bx[i].item()
+                    total_delayed_frames = total_valid_frames + max_delay_pattern
+                    delayed_codes = dec_output.generated_tokens[
+                        i : i + 1,
+                        decode_start : decode_start + total_delayed_frames,
+                        :,
+                    ]
+                    decode_lengths = torch.tensor(
+                        [total_valid_frames],
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+                    decoded_audio = self._generate_output(delayed_codes, decode_lengths)[0]
+                    before_trim_ms = (
+                        1000.0 * float(len(decoded_audio)) / float(DEFAULT_SAMPLE_RATE)
+                        if decoded_audio is not None
+                        else 0.0
+                    )
+                    discard_samples = prompt_context_frames * SAMPLE_RATE_RATIO
+                    trimmed_samples.append(discard_samples)
+                    output_duration_before_trim_ms.append(before_trim_ms)
+                    if decoded_audio is None:
+                        outputs.append(None)
+                        output_duration_after_trim_ms.append(0.0)
+                    else:
+                        trimmed_audio = decoded_audio[discard_samples:]
+                        outputs.append(trimmed_audio)
+                        output_duration_after_trim_ms.append(
+                            1000.0
+                            * float(len(trimmed_audio))
+                            / float(DEFAULT_SAMPLE_RATE)
+                        )
+            else:
+                outputs = self._generate_output(generated_codes, lengths_Bx)
+                trimmed_samples = [0] * batch_size
+                prompt_context_frames_per_item = [0] * batch_size
+                output_duration_before_trim_ms = [
+                    1000.0 * float(len(audio)) / float(DEFAULT_SAMPLE_RATE)
+                    if audio is not None
+                    else 0.0
+                    for audio in outputs
+                ]
+                output_duration_after_trim_ms = list(output_duration_before_trim_ms)
 
             # --- Stream probe final tail ---
             if (
@@ -1079,6 +1147,13 @@ class Dia:
             "requested_max_tokens": requested_max_tokens,
             "effective_max_tokens": effective_max_tokens,
             "stop_constraints": stop_constraints,
+            "trim_audio_prompt_from_output": trim_audio_prompt_from_output,
+            "prompt_code_steps": prompt_code_steps,
+            "prompt_duration_ms": prompt_duration_ms,
+            "prompt_context_frames": prompt_context_frames_per_item,
+            "trimmed_samples": trimmed_samples,
+            "output_duration_before_trim_ms": output_duration_before_trim_ms,
+            "output_duration_after_trim_ms": output_duration_after_trim_ms,
             "eos_detected": [bool(v) for v in eos_detected_Bx.detach().cpu().tolist()],
             "eos_step": [
                 None if int(v) < 0 else int(v) for v in eos_step_Bx.detach().cpu().tolist()

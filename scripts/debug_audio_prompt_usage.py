@@ -17,6 +17,15 @@ from parkiet.dia.model import DEFAULT_SAMPLE_RATE, Dia
 DEFAULT_TEXT = "[S1] Goedemiddag, waarmee kan ik u helpen?"
 
 
+def parse_bool(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Debug Dia audio_prompt behavior and compare direct prompt usage modes."
@@ -41,6 +50,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, default=0.80)
     parser.add_argument("--cfg-filter-top-k", type=int, default=50)
     parser.add_argument("--max-tokens", type=int, default=1024)
+    parser.add_argument("--trim-audio-prompt", type=parse_bool, default=True)
     return parser.parse_args(argv)
 
 
@@ -77,6 +87,38 @@ def build_full_text(prompt_transcript: str | None, target_text: str) -> str:
     return target_text
 
 
+def get_prompt_debug_info(
+    metadata: dict[str, Any],
+) -> tuple[float | None, int | None, int | None, float | None, float | None]:
+    prompt_duration_ms = None
+    prompt_code_steps = None
+    trimmed_samples = None
+    output_duration_before_trim = None
+    output_duration_after_trim = None
+
+    if metadata.get("prompt_duration_ms"):
+        prompt_duration_ms = float(metadata["prompt_duration_ms"][0])
+    if metadata.get("prompt_code_steps"):
+        prompt_code_steps = int(metadata["prompt_code_steps"][0])
+    if metadata.get("trimmed_samples"):
+        trimmed_samples = int(metadata["trimmed_samples"][0])
+    if metadata.get("output_duration_before_trim_ms"):
+        output_duration_before_trim = float(metadata["output_duration_before_trim_ms"][0])
+    if metadata.get("output_duration_after_trim_ms"):
+        output_duration_after_trim = float(metadata["output_duration_after_trim_ms"][0])
+    return (
+        prompt_duration_ms,
+        prompt_code_steps,
+        trimmed_samples,
+        output_duration_before_trim,
+        output_duration_after_trim,
+    )
+
+
+def trim_waveform_prefix(audio: np.ndarray, trimmed_samples: int) -> np.ndarray:
+    return np.asarray(audio[max(0, trimmed_samples) :], dtype=np.float32).copy()
+
+
 def run_case(
     model: Dia,
     *,
@@ -92,6 +134,7 @@ def run_case(
     audio_prompt: str | torch.Tensor | None = None,
     prompt_tensor_shape: list[int] | None = None,
     prompt_tensor_dtype: str | None = None,
+    trim_audio_prompt_from_output: bool = False,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     audio = model.generate(
@@ -103,6 +146,7 @@ def run_case(
         top_p=top_p,
         cfg_filter_top_k=cfg_filter_top_k,
         max_tokens=max_tokens,
+        trim_audio_prompt_from_output=trim_audio_prompt_from_output,
         verbose=False,
     )
     audio_np = np.asarray(audio, dtype=np.float32).reshape(-1)
@@ -124,7 +168,15 @@ def run_case(
         ),
         "audio_prompt_tensor_shape": prompt_tensor_shape,
         "audio_prompt_tensor_dtype": prompt_tensor_dtype,
+        "trim_audio_prompt_from_output": trim_audio_prompt_from_output,
     }
+    (
+        prompt_duration_ms,
+        prompt_code_steps,
+        trimmed_samples,
+        output_duration_before_trim,
+        output_duration_after_trim,
+    ) = get_prompt_debug_info(metadata["generation_metadata"])
     print(f"case={case_name}")
     print(f"  wav_path={wav_path}")
     print(
@@ -133,6 +185,15 @@ def run_case(
     )
     if prompt_tensor_shape is not None:
         print(f"  audio_prompt_tensor_shape={prompt_tensor_shape} dtype={prompt_tensor_dtype}")
+    if prompt_code_steps is not None:
+        print(
+            "  prompt_debug="
+            f"prompt_duration_ms={prompt_duration_ms} "
+            f"prompt_code_steps={prompt_code_steps} "
+            f"trimmed_samples={trimmed_samples} "
+            f"output_duration_before_trim_ms={output_duration_before_trim} "
+            f"output_duration_after_trim_ms={output_duration_after_trim}"
+        )
     print(f"  generation_metadata={json.dumps(metadata['generation_metadata'], ensure_ascii=False)}")
     return metadata
 
@@ -185,6 +246,7 @@ def main(argv: list[str] | None = None) -> int:
                 top_p=args.top_p,
                 cfg_filter_top_k=args.cfg_filter_top_k,
                 max_tokens=args.max_tokens,
+                trim_audio_prompt_from_output=False,
             ),
             run_case(
                 model,
@@ -198,6 +260,7 @@ def main(argv: list[str] | None = None) -> int:
                 cfg_filter_top_k=args.cfg_filter_top_k,
                 max_tokens=args.max_tokens,
                 audio_prompt=str(reference_wav),
+                trim_audio_prompt_from_output=args.trim_audio_prompt,
             ),
         ]
 
@@ -219,6 +282,7 @@ def main(argv: list[str] | None = None) -> int:
                 audio_prompt=prompt_codes_tensor,
                 prompt_tensor_shape=list(prompt_codes_tensor.shape),
                 prompt_tensor_dtype=str(prompt_codes_tensor.dtype),
+                trim_audio_prompt_from_output=args.trim_audio_prompt,
             )
         )
         results.append(
@@ -234,6 +298,7 @@ def main(argv: list[str] | None = None) -> int:
                 cfg_filter_top_k=args.cfg_filter_top_k,
                 max_tokens=args.max_tokens,
                 audio_prompt=str(cropped_wav_path),
+                trim_audio_prompt_from_output=args.trim_audio_prompt,
             )
         )
         results.append(
@@ -251,6 +316,7 @@ def main(argv: list[str] | None = None) -> int:
                 audio_prompt=cropped_prompt_codes,
                 prompt_tensor_shape=list(cropped_prompt_codes.shape),
                 prompt_tensor_dtype=str(cropped_prompt_codes.dtype),
+                trim_audio_prompt_from_output=args.trim_audio_prompt,
             )
         )
 
