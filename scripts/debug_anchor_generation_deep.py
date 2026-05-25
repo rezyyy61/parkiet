@@ -22,6 +22,7 @@ ALLOWED_CASES = {
     "A_no_prompt",
     "B_prompt_path_current",
     "C_prompt_codes_current",
+    "D_custom",
     "D_context_32",
     "D_context_64",
     "D_context_128",
@@ -54,6 +55,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--prompt-transcript", default=DEFAULT_PROMPT_TRANSCRIPT)
     parser.add_argument("--continuation-text", default=DEFAULT_CONTINUATION_TEXT)
     parser.add_argument("--case", choices=sorted(ALLOWED_CASES), default="all")
+    parser.add_argument("--context-frames", type=int, default=40)
+    parser.add_argument("--context-frames-list", default=None)
     parser.add_argument("--output-dir", default="debug_anchor_generation_deep")
     parser.add_argument("--use-torch-compile", type=parse_bool, default=False)
     parser.add_argument("--cfg-scale", type=float, default=3.0)
@@ -123,6 +126,18 @@ def cleanup_torch_memory(device: torch.device | None) -> None:
         torch.cuda.empty_cache()
         if hasattr(torch.cuda, "reset_peak_memory_stats"):
             torch.cuda.reset_peak_memory_stats(device)
+
+
+def parse_context_frames_list(raw_value: str | None) -> list[int]:
+    if raw_value is None or not raw_value.strip():
+        return []
+    values: list[int] = []
+    for item in raw_value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        values.append(max(0, int(item)))
+    return values
 
 
 def set_eval_mode(model: Dia) -> None:
@@ -391,12 +406,17 @@ def manual_old_streamer_style_case(
         "prompt_code_steps": int(prompt_codes.shape[0]),
         "prompt_duration_ms": float(prompt_codes.shape[0]) * SAMPLE_RATE_RATIO / DEFAULT_SAMPLE_RATE * 1000.0,
         "generated_token_count": int(generated_token_count),
+        "context_frames": int(context_frames),
         "decode_start": int(decode_start),
         "decode_end": int(decode_start + total_delayed_frames),
         "decoded_code_steps": int(total_valid_frames),
         "trimmed_code_steps": int(generated_token_count),
         "output_samples_before_trim": int(len(context_audio)),
         "output_samples_after_trim": int(len(continuation_audio)),
+        "trimmed_samples": int(context_trim_samples),
+        "output_duration_after_trim_ms": (
+            1000.0 * float(len(continuation_audio)) / float(DEFAULT_SAMPLE_RATE)
+        ),
         "context_frames_requested": int(context_frames),
         "context_frames_used": int(actual_prompt_context_frames),
         "memory_logs": memory_logs,
@@ -458,6 +478,7 @@ def print_case_metadata(metadata: dict[str, Any]) -> None:
     if "decode_start" in metadata:
         print(
             "  decode="
+            f"context_frames={metadata.get('context_frames')} "
             f"decode_start={metadata.get('decode_start')} "
             f"decode_end={metadata.get('decode_end')} "
             f"decoded_code_steps={metadata.get('decoded_code_steps')} "
@@ -466,7 +487,9 @@ def print_case_metadata(metadata: dict[str, Any]) -> None:
         print(
             "  output="
             f"output_samples_before_trim={metadata.get('output_samples_before_trim')} "
-            f"output_samples_after_trim={metadata.get('output_samples_after_trim')}"
+            f"output_samples_after_trim={metadata.get('output_samples_after_trim')} "
+            f"trimmed_samples={metadata.get('trimmed_samples')} "
+            f"output_duration_after_trim_ms={metadata.get('output_duration_after_trim_ms')}"
         )
     stats = metadata["audio_stats"]
     print(
@@ -520,6 +543,11 @@ def main(argv: list[str] | None = None) -> int:
     else:
         requested_cases = [args.case]
 
+    custom_context_frames = max(0, int(args.context_frames))
+    requested_context_frames = parse_context_frames_list(args.context_frames_list)
+    if args.case == "D_custom" and not requested_context_frames:
+        requested_context_frames = [custom_context_frames]
+
     try:
         for requested_case in requested_cases:
             if requested_case == "A_no_prompt":
@@ -550,16 +578,25 @@ def main(argv: list[str] | None = None) -> int:
                     output_dir=output_dir,
                 )
             else:
-                context_frames = int(requested_case.rsplit("_", 1)[-1])
-                case_result = manual_old_streamer_style_case(
-                    model,
-                    case_name=f"D_streamer_style_context_{context_frames}",
-                    full_text=full_text,
-                    prompt_codes=prompt_codes,
-                    args=args,
-                    context_frames=context_frames,
-                    output_dir=output_dir,
-                )
+                if requested_case == "D_custom":
+                    case_context_frames = requested_context_frames
+                else:
+                    case_context_frames = [int(requested_case.rsplit("_", 1)[-1])]
+
+                for context_frames in case_context_frames:
+                    case_result = manual_old_streamer_style_case(
+                        model,
+                        case_name=f"D_streamer_style_context_{context_frames}",
+                        full_text=full_text,
+                        prompt_codes=prompt_codes,
+                        args=args,
+                        context_frames=context_frames,
+                        output_dir=output_dir,
+                    )
+                    metadata["cases"].append(case_result)
+                    metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+                    cleanup_torch_memory(getattr(model, "device", None))
+                continue
 
             metadata["cases"].append(case_result)
             metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
