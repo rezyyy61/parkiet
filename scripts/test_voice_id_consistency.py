@@ -45,6 +45,17 @@ def decode_payload(payload: bytes | np.ndarray, sample_format: str) -> np.ndarra
     return np.asarray(payload, dtype=np.float32).copy()
 
 
+def get_latest_phrase_metric(session):
+    metrics = session.phrase_metrics
+    if not metrics:
+        return None
+    if isinstance(metrics, list):
+        return metrics[-1]
+    if isinstance(metrics, dict):
+        return list(metrics.values())[-1]
+    return None
+
+
 def build_backend(args: argparse.Namespace, *, voice_id: str | None) -> DiaRealtimeBackend:
     return DiaRealtimeBackend.from_local_paths(
         config_path=args.config_path,
@@ -115,7 +126,7 @@ def synthesize_run(
         phrase_path = run_dir / f"per_phrase_{phrase_index + 1:03d}.wav"
         sf.write(phrase_path, phrase_audio, args.output_sample_rate)
 
-        phrase_metric = session.phrase_metrics[-1] if session.phrase_metrics else None
+        phrase_metric = get_latest_phrase_metric(session)
         phrase_results.append(
             {
                 "phrase_text": phrase_text,
