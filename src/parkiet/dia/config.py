@@ -163,7 +163,9 @@ class DiaConfig(BaseModel):
         Raises:
             ValueError: If the path is not a file with a .json extension.
         """
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        dir_name = os.path.dirname(path)
+        if dir_name:
+            os.makedirs(dir_name, exist_ok=True)
         config_json = self.model_dump_json(indent=2)
         with open(path, "w") as f:
             f.write(config_json)
