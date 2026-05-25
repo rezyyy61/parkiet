@@ -68,6 +68,11 @@ def convert_torch_to_nnx(torch_model, nnx_model, dia_config: DiaConfig):
         torch_key = torch_key.replace("wo.kernel", "wo.weight")
         torch_key = torch_key.replace("norm.scale", "norm.weight")
         torch_key = torch_key.replace("logits_dense.kernel", "logits_dense.weight")
+        torch_key = torch_key.replace("speaker_embedding.embedding", "speaker_embedding.weight")
+        torch_key = torch_key.replace("speaker_to_encoder.kernel", "speaker_to_encoder.weight")
+        torch_key = torch_key.replace("speaker_to_encoder.bias", "speaker_to_encoder.bias")
+        torch_key = torch_key.replace("speaker_to_decoder.kernel", "speaker_to_decoder.weight")
+        torch_key = torch_key.replace("speaker_to_decoder.bias", "speaker_to_decoder.bias")
 
         # Handle decoder embeddings
         for i in range(0, dia_config.decoder_config.num_channels):
@@ -118,6 +123,11 @@ def convert_jax_to_torch(nnx_model, torch_model, dia_config: DiaConfig):
         torch_key = torch_key.replace("wo.kernel", "wo.weight")
         torch_key = torch_key.replace("norm.scale", "norm.weight")
         torch_key = torch_key.replace("logits_dense.kernel", "logits_dense.weight")
+        torch_key = torch_key.replace("speaker_embedding.embedding", "speaker_embedding.weight")
+        torch_key = torch_key.replace("speaker_to_encoder.kernel", "speaker_to_encoder.weight")
+        torch_key = torch_key.replace("speaker_to_encoder.bias", "speaker_to_encoder.bias")
+        torch_key = torch_key.replace("speaker_to_decoder.kernel", "speaker_to_decoder.weight")
+        torch_key = torch_key.replace("speaker_to_decoder.bias", "speaker_to_decoder.bias")
 
         # Handle decoder embeddings
         for i in range(0, dia_config.decoder_config.num_channels):

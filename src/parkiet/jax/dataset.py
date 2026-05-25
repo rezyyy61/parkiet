@@ -306,6 +306,10 @@ class AudioTextDataset:
                     batch_data["text"].append(sample["text"])
                     batch_data["audio"].append(sample["audio"])
                     batch_data["cb_weight"].append(sample["cb_weight"])
+                    if "speaker_id" in sample:
+                        batch_data.setdefault("speaker_id", []).append(
+                            sample["speaker_id"]
+                        )
 
                 yield batch_data
 

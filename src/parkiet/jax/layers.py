@@ -584,8 +584,15 @@ class Encoder(nnx.Module):
             rngs=rngs,
         )
 
-    def __call__(self, x_ids: jnp.ndarray, state: EncoderInferenceState) -> jnp.ndarray:
+    def __call__(
+        self,
+        x_ids: jnp.ndarray,
+        state: EncoderInferenceState,
+        speaker_condition: jnp.ndarray | None = None,
+    ) -> jnp.ndarray:
         x = self.embedding(x_ids)
+        if speaker_condition is not None:
+            x = x + speaker_condition[:, None, :].astype(x.dtype)
 
         # Process through all encoder layers
         for layer in self.layers:
@@ -851,6 +858,7 @@ class Decoder(nnx.Module):
         tgt_ids_Bx1xC: jnp.ndarray,  # (B, 1, C)
         state: DecoderInferenceState,
         current_idx: int,
+        speaker_condition: jnp.ndarray | None = None,
     ) -> jnp.ndarray:
         """
         Performs a single decoding step, managing KV caches layer by layer.
@@ -863,6 +871,8 @@ class Decoder(nnx.Module):
             channel_tokens = tgt_ids_Bx1xC[..., i]
             channel_embed = self.embeddings[i](channel_tokens)
             x = channel_embed if x is None else x + channel_embed
+        if speaker_condition is not None:
+            x = x + speaker_condition[:, None, :].astype(x.dtype)
 
         for i, layer in enumerate(self.layers):
             self_cache = state.self_attn_cache[i]
@@ -890,12 +900,15 @@ class Decoder(nnx.Module):
         enc_out: jnp.ndarray,
         self_attn_cache: list[KVCache],
         cross_attn_cache: list[KVCache],
+        speaker_condition: jnp.ndarray | None = None,
     ):
         x = None
         for i in range(self.num_channels):
             channel_tokens = tgt_ids_Bx1xC[..., i]
             channel_embed = self.embeddings[i](channel_tokens)
             x = channel_embed if x is None else x + channel_embed
+        if speaker_condition is not None:
+            x = x + speaker_condition[:, None, :].astype(x.dtype)
 
         for i, layer in enumerate(self.layers):
             self_cache = self_attn_cache[i]
@@ -916,7 +929,12 @@ class Decoder(nnx.Module):
         logits_Bx1xCxV = self.logits_dense(x)
         return logits_Bx1xCxV, self_attn_cache, cross_attn_cache
 
-    def __call__(self, tgt_ids_BxTxC: jnp.ndarray, state) -> jnp.ndarray:
+    def __call__(
+        self,
+        tgt_ids_BxTxC: jnp.ndarray,
+        state,
+        speaker_condition: jnp.ndarray | None = None,
+    ) -> jnp.ndarray:
         """
         Forward pass for the Decoder stack.
 
@@ -936,6 +954,8 @@ class Decoder(nnx.Module):
             channel_tokens = tgt_ids_BxTxC[..., i]
             channel_embed = self.embeddings[i](channel_tokens)
             x = channel_embed if x is None else x + channel_embed
+        if speaker_condition is not None:
+            x = x + speaker_condition[:, None, :].astype(x.dtype)
 
         # In training mode the cache is None
         for i, layer in enumerate(self.layers):
@@ -973,6 +993,10 @@ class DiaModel(nnx.Module):
         self.config = config
         self.compute_dtype = compute_dtype
         self.param_dtype = param_dtype
+        if self.config.speaker_conditioning_enabled and self.config.num_speakers <= 0:
+            raise ValueError(
+                "speaker_conditioning_enabled=True requires num_speakers > 0"
+            )
 
         self.encoder = Encoder(
             config=self.config,
@@ -986,3 +1010,45 @@ class DiaModel(nnx.Module):
             param_dtype=self.param_dtype,
             rngs=rngs,
         )
+        if self.config.speaker_conditioning_enabled:
+            self.speaker_embedding = nnx.Embed(
+                num_embeddings=self.config.num_speakers,
+                features=self.config.speaker_embedding_dim,
+                dtype=self.compute_dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
+            self.speaker_to_encoder = nnx.Linear(
+                in_features=self.config.speaker_embedding_dim,
+                out_features=self.config.encoder_config.hidden_size,
+                dtype=self.compute_dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
+            self.speaker_to_decoder = nnx.Linear(
+                in_features=self.config.speaker_embedding_dim,
+                out_features=self.config.decoder_config.hidden_size,
+                dtype=self.compute_dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
+        else:
+            self.speaker_embedding = None
+            self.speaker_to_encoder = None
+            self.speaker_to_decoder = None
+
+    def get_speaker_condition(
+        self, speaker_ids: jnp.ndarray
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        if not self.config.speaker_conditioning_enabled:
+            raise ValueError("Speaker conditioning is disabled in this model config")
+        if self.speaker_embedding is None:
+            raise ValueError("Speaker conditioning modules are not initialized")
+        speaker_embed = self.speaker_embedding(speaker_ids)
+        encoder_speaker_bias = self.speaker_to_encoder(speaker_embed).astype(
+            self.compute_dtype
+        )
+        decoder_speaker_bias = self.speaker_to_decoder(speaker_embed).astype(
+            self.compute_dtype
+        )
+        return encoder_speaker_bias, decoder_speaker_bias

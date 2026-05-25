@@ -114,6 +114,8 @@ def load_and_prepare_batch(
         "audio_input": audio_input,
         "audio_target": audio_target,
     }
+    if "speaker_id" in batch_jax:
+        batch["speaker_id"] = batch_jax["speaker_id"]
 
     return batch
 
@@ -148,6 +150,7 @@ class TrainingConfig:
         self.tensorboard_dir: str = kwargs.get(
             "tensorboard_dir", f"logs/parkiet-{timestamp}"
         )
+        self.speaker_vocab_path: str | None = kwargs.get("speaker_vocab_path")
 
 
 def create_cosine_schedule_with_warmup(
@@ -171,6 +174,24 @@ def create_cosine_schedule_with_warmup(
     return schedule_fn
 
 
+def resolve_training_speaker_condition(
+    model: DiaModel,
+    dia_config: DiaConfig,
+    speaker_id: jnp.ndarray | None,
+) -> tuple[jnp.ndarray | None, jnp.ndarray | None]:
+    if not dia_config.speaker_conditioning_enabled:
+        return None, None
+    if speaker_id is None:
+        raise ValueError(
+            "speaker_id is required when speaker_conditioning_enabled=True"
+        )
+    if not hasattr(model, "get_speaker_condition"):
+        raise NotImplementedError(
+            "JAX DiaModel speaker conditioning hooks are not available"
+        )
+    return model.get_speaker_condition(speaker_id)
+
+
 @nnx.jit(static_argnames=("dia_config",))
 def compute_loss(
     model: DiaModel,
@@ -178,6 +199,7 @@ def compute_loss(
     audio_input: jnp.ndarray,
     audio_target: jnp.ndarray,
     dia_config: DiaConfig,
+    speaker_id: jnp.ndarray | None = None,
 ) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
     """
     Compute the loss for a batch of data using teacher forcing.
@@ -200,7 +222,12 @@ def compute_loss(
     enc_state = EncoderTrainingState.new(
         dia_config.encoder_config.max_position_embeddings, text_tokens
     )
-    encoder_outputs = model.encoder(text_tokens, enc_state)
+    encoder_speaker_condition, decoder_speaker_condition = (
+        resolve_training_speaker_condition(model, dia_config, speaker_id)
+    )
+    encoder_outputs = model.encoder(
+        text_tokens, enc_state, speaker_condition=encoder_speaker_condition
+    )
 
     # Create simplified decoder state for training
     audio_seq_len = audio_input.shape[1]
@@ -213,7 +240,9 @@ def compute_loss(
     )
 
     # Forward pass through decoder in training mode (no cache management)
-    decoder_outputs = model.decoder(audio_input, dec_state)
+    decoder_outputs = model.decoder(
+        audio_input, dec_state, speaker_condition=decoder_speaker_condition
+    )
 
     # Compute loss
     # decoder_outputs: [batch_size, seq_len, channels, vocab_size]
@@ -320,6 +349,7 @@ def compute_gradients_step(
             batch["audio_input"],
             batch["audio_target"],
             dia_config,
+            batch.get("speaker_id"),
         )
 
     # Compute gradients
@@ -360,6 +390,7 @@ def evaluate_step(
         batch["audio_input"],
         batch["audio_target"],
         dia_config,
+        batch.get("speaker_id"),
     )
 
 
@@ -556,6 +587,7 @@ def main():
         parquet_path="shards",
         transcription_clean_prob=0.1,
         text_dropout_prob=0.15,
+        speaker_vocab=training_config.speaker_vocab_path,
     )
 
     step = 0
