@@ -686,6 +686,7 @@ class Dia:
         max_output_tokens_per_char: float | None = None,
         hard_stop_after_tokens: int | None = None,
         trim_audio_prompt_from_output: bool = False,
+        audio_prompt_context_frames: int = DEFAULT_PROMPT_TRIM_CONTEXT_FRAMES,
         stream_callback = None,
     ) -> np.ndarray | list[np.ndarray]:
         """Generates audio corresponding to the input text.
@@ -1042,18 +1043,26 @@ class Dia:
                 prompt_context_frames_per_item: list[int] = []
                 output_duration_before_trim_ms: list[float] = []
                 output_duration_after_trim_ms: list[float] = []
+                decode_start_steps: list[int] = []
+                decode_end_steps: list[int] = []
+                decoded_code_steps: list[int] = []
+                trimmed_code_steps: list[int] = []
 
                 for i in range(batch_size):
                     prefill_step = dec_output.prefill_steps[i]
                     prompt_context_frames = min(
                         max(0, prefill_step),
-                        DEFAULT_PROMPT_TRIM_CONTEXT_FRAMES,
+                        max(0, audio_prompt_context_frames),
                     )
                     prompt_context_frames_per_item.append(prompt_context_frames)
 
                     decode_start = max(0, prefill_step - prompt_context_frames)
+                    decode_start_steps.append(int(decode_start))
                     total_valid_frames = prompt_context_frames + lengths_Bx[i].item()
+                    decoded_code_steps.append(int(total_valid_frames))
+                    trimmed_code_steps.append(int(lengths_Bx[i].item()))
                     total_delayed_frames = total_valid_frames + max_delay_pattern
+                    decode_end_steps.append(int(decode_start + total_delayed_frames))
                     delayed_codes = dec_output.generated_tokens[
                         i : i + 1,
                         decode_start : decode_start + total_delayed_frames,
@@ -1071,13 +1080,14 @@ class Dia:
                         else 0.0
                     )
                     discard_samples = prompt_context_frames * SAMPLE_RATE_RATIO
+                    end_sample = discard_samples + lengths_Bx[i].item() * SAMPLE_RATE_RATIO
                     trimmed_samples.append(discard_samples)
                     output_duration_before_trim_ms.append(before_trim_ms)
                     if decoded_audio is None:
                         outputs.append(None)
                         output_duration_after_trim_ms.append(0.0)
                     else:
-                        trimmed_audio = decoded_audio[discard_samples:]
+                        trimmed_audio = decoded_audio[discard_samples:end_sample]
                         outputs.append(trimmed_audio)
                         output_duration_after_trim_ms.append(
                             1000.0
@@ -1095,6 +1105,10 @@ class Dia:
                     for audio in outputs
                 ]
                 output_duration_after_trim_ms = list(output_duration_before_trim_ms)
+                decode_start_steps = [0] * batch_size
+                decode_end_steps = [0] * batch_size
+                decoded_code_steps = [int(v) for v in lengths_Bx.detach().cpu().tolist()]
+                trimmed_code_steps = [int(v) for v in lengths_Bx.detach().cpu().tolist()]
 
             # --- Stream probe final tail ---
             if (
@@ -1150,8 +1164,13 @@ class Dia:
             "trim_audio_prompt_from_output": trim_audio_prompt_from_output,
             "prompt_code_steps": prompt_code_steps,
             "prompt_duration_ms": prompt_duration_ms,
+            "audio_prompt_context_frames_requested": int(audio_prompt_context_frames),
             "prompt_context_frames": prompt_context_frames_per_item,
             "trimmed_samples": trimmed_samples,
+            "decode_start": decode_start_steps,
+            "decode_end": decode_end_steps,
+            "decoded_code_steps": decoded_code_steps,
+            "trimmed_code_steps": trimmed_code_steps,
             "output_duration_before_trim_ms": output_duration_before_trim_ms,
             "output_duration_after_trim_ms": output_duration_after_trim_ms,
             "eos_detected": [bool(v) for v in eos_detected_Bx.detach().cpu().tolist()],

@@ -54,6 +54,7 @@ class DiaLike(Protocol):
         max_output_tokens_per_char: float | None = None,
         hard_stop_after_tokens: int | None = None,
         trim_audio_prompt_from_output: bool = False,
+        audio_prompt_context_frames: int = 128,
         stream_callback=None,
     ) -> np.ndarray | list[np.ndarray]:
         ...
@@ -91,6 +92,7 @@ class DiaRealtimeBackend:
         audio_prompt_path: str | None = None,
         audio_prompt_codes: torch.Tensor | None = None,
         trim_audio_prompt_from_output: bool = False,
+        audio_prompt_context_frames: int = 128,
         collect_timings: bool = False,
         model_load_time_ms: float | None = None,
     ):
@@ -110,6 +112,7 @@ class DiaRealtimeBackend:
         self.audio_prompt_path = audio_prompt_path
         self.audio_prompt_codes = audio_prompt_codes
         self.trim_audio_prompt_from_output = trim_audio_prompt_from_output
+        self.audio_prompt_context_frames = audio_prompt_context_frames
         self.collect_timings = collect_timings
         self.model_load_time_ms = model_load_time_ms
         self.last_timing_breakdown: dict[str, float | int | list[int] | bool | None] = {}
@@ -145,6 +148,7 @@ class DiaRealtimeBackend:
             "voice_id": self.voice_id,
             "audio_prompt_source": self._describe_audio_prompt_source(resolved_audio_prompt),
             "trim_audio_prompt_from_output": self.trim_audio_prompt_from_output,
+            "audio_prompt_context_frames": self.audio_prompt_context_frames,
         }
 
         with _DiaGenerateProfiler(self.model, timings, enabled=self.collect_timings):
@@ -162,6 +166,7 @@ class DiaRealtimeBackend:
                 hard_stop_after_tokens=self.hard_stop_after_tokens,
                 audio_prompt=resolved_audio_prompt,
                 trim_audio_prompt_from_output=self.trim_audio_prompt_from_output,
+                audio_prompt_context_frames=self.audio_prompt_context_frames,
                 verbose=False,
                 stream_callback=None,
             )
@@ -211,6 +216,7 @@ class DiaRealtimeBackend:
         audio_prompt_path: str | None = None,
         audio_prompt_codes: torch.Tensor | None = None,
         trim_audio_prompt_from_output: bool = False,
+        audio_prompt_context_frames: int = 128,
         collect_timings: bool = False,
     ) -> "DiaRealtimeBackend":
         load_started = perf_counter()
@@ -239,6 +245,7 @@ class DiaRealtimeBackend:
             audio_prompt_path=audio_prompt_path,
             audio_prompt_codes=audio_prompt_codes,
             trim_audio_prompt_from_output=trim_audio_prompt_from_output,
+            audio_prompt_context_frames=audio_prompt_context_frames,
             collect_timings=collect_timings,
             model_load_time_ms=model_load_time_ms,
         )
