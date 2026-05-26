@@ -15,17 +15,11 @@ from parkiet.dia.config import DiaConfig
 from parkiet.dia.model import Dia, load_state_dict_allowing_missing_speaker_modules
 from parkiet.dia.state import DecoderInferenceState, EncoderInferenceState
 from parkiet.jax.dataset import create_dataset
-from scripts.tiny_speaker_finetune_smoke import summarize_parquet_speaker_ids
+from parkiet.speaker_dataset_summary import (
+    summarize_parquet_speaker_ids,
+    summarize_rows_mapped_speaker_ids,
+)
 from parkiet.speaker_vocab import load_speaker_vocab
-
-
-def summarize_rows_mapped_speaker_ids(
-    rows: list[dict[str, Any]],
-    speaker_vocab: dict[str, Any],
-) -> dict[str, Any]:
-    from scripts.tiny_speaker_finetune_smoke import summarize_rows_mapped_speaker_ids as _summarize
-
-    return _summarize(rows, speaker_vocab)
 
 
 def summarize_batch_speaker_ids(batch: dict[str, torch.Tensor]) -> list[int]:

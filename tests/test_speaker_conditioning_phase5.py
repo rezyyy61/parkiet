@@ -9,13 +9,10 @@ import torch
 from parkiet.dia.config import DecoderConfig, DiaConfig, EncoderConfig
 from parkiet.dia.layers import DiaModel
 from parkiet.dia.model import load_state_dict_allowing_missing_speaker_modules
+from parkiet.speaker_dataset_summary import summarize_rows_mapped_speaker_ids
 from scripts.create_speaker_conditioned_config import (
     build_speaker_conditioned_config,
     derive_num_speakers,
-)
-from scripts.tiny_speaker_finetune_smoke import summarize_rows_mapped_speaker_ids
-from scripts.tiny_speaker_finetune_train import (
-    summarize_rows_mapped_speaker_ids as summarize_train_rows_mapped_speaker_ids,
 )
 
 
@@ -183,7 +180,7 @@ def test_smoke_reporting_falls_back_to_default_speaker_id():
 
 
 def test_tiny_train_helper_maps_numpy_chunk_owner_to_model_speaker_id():
-    summary = summarize_train_rows_mapped_speaker_ids(
+    summary = summarize_rows_mapped_speaker_ids(
         [{"chunk_owner": np.int64(1)}],
         {
             "default_speaker_id": 0,
@@ -198,11 +195,11 @@ def test_tiny_train_helper_falls_back_to_default_speaker_id():
         "default_speaker_id": 0,
         "db_speaker_id_to_model_speaker_id": {"1": 1},
     }
-    assert summarize_train_rows_mapped_speaker_ids(
+    assert summarize_rows_mapped_speaker_ids(
         [{"chunk_owner": None}],
         speaker_vocab,
     )["speaker_id_unique"] == [0]
-    assert summarize_train_rows_mapped_speaker_ids(
+    assert summarize_rows_mapped_speaker_ids(
         [{"chunk_owner": 999}],
         speaker_vocab,
     )["speaker_id_unique"] == [0]
