@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 from parkiet.dia.config import DiaConfig
-from parkiet.dia.model import Dia, load_state_dict_allowing_missing_speaker_modules
+from parkiet.dia.model import Dia
 
 
 DEFAULT_OUTPUT_SAMPLE_RATE = 44100
@@ -62,16 +62,13 @@ def load_conditioned_model(
     if not config.speaker_conditioning_enabled:
         raise ValueError("Expected speaker_conditioning_enabled=True")
 
-    dia = Dia(config=config, compute_dtype="float32", load_dac=False)
-    state_dict = torch.load(checkpoint_path, map_location=dia.device)
-    load_state_dict_allowing_missing_speaker_modules(
-        dia.model,
-        state_dict,
+    dia = Dia.from_local(
+        config_path=str(config_path),
+        checkpoint_path=str(checkpoint_path),
+        compute_dtype="float32",
+        load_dac=True,
         allow_missing_speaker_modules=allow_missing_speaker_modules,
     )
-    dia.model.to(dia.device)
-    dia.model.eval()
-    dia._load_dac_model()
     return dia, config
 
 
@@ -88,6 +85,12 @@ def ensure_waveform(audio: Any) -> np.ndarray:
     if waveform.ndim == 2 and 1 in waveform.shape:
         waveform = waveform.reshape(-1)
     if waveform.ndim != 1:
+        if waveform.ndim == 2 and waveform.shape[-1] == 9 and np.issubdtype(
+            waveform.dtype, np.integer
+        ):
+            raise ValueError(
+                "Conditioned generation returned codec codes; DAC decoder was not loaded or decode path was skipped."
+            )
         raise ValueError(f"Expected 1D waveform, got shape {waveform.shape}")
     if not np.issubdtype(waveform.dtype, np.number):
         raise TypeError(f"Expected numeric waveform dtype, got {waveform.dtype}")

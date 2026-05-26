@@ -217,6 +217,7 @@ class Dia:
         compute_dtype: str | ComputeDtype = ComputeDtype.FLOAT32,
         device: torch.device | None = None,
         load_dac: bool = True,
+        allow_missing_speaker_modules: bool = False,
     ) -> "Dia":
         """Loads the Dia model from local configuration and checkpoint files.
 
@@ -226,6 +227,9 @@ class Dia:
             compute_dtype: The computation dtype to use.
             device: The device to load the model onto. If None, will automatically select the best available device.
             load_dac: Whether to load the DAC model.
+            allow_missing_speaker_modules: Whether to allow checkpoints to omit
+                speaker-conditioning module weights when
+                speaker_conditioning_enabled=True.
 
         Returns:
             An instance of the Dia model loaded with weights and set to eval mode.
@@ -242,7 +246,14 @@ class Dia:
 
         try:
             state_dict = torch.load(checkpoint_path, map_location=dia.device)
-            dia.model.load_state_dict(state_dict)
+            if allow_missing_speaker_modules:
+                load_state_dict_allowing_missing_speaker_modules(
+                    dia.model,
+                    state_dict,
+                    allow_missing_speaker_modules=dia.config.speaker_conditioning_enabled,
+                )
+            else:
+                dia.model.load_state_dict(state_dict)
         except FileNotFoundError:
             raise FileNotFoundError(f"Checkpoint file not found at {checkpoint_path}")
         except RuntimeError as e:
