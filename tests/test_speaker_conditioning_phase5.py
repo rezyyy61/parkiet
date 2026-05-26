@@ -14,6 +14,9 @@ from scripts.create_speaker_conditioned_config import (
     derive_num_speakers,
 )
 from scripts.tiny_speaker_finetune_smoke import summarize_rows_mapped_speaker_ids
+from scripts.tiny_speaker_finetune_train import (
+    summarize_rows_mapped_speaker_ids as summarize_train_rows_mapped_speaker_ids,
+)
 
 
 def _base_config() -> DiaConfig:
@@ -174,6 +177,32 @@ def test_smoke_reporting_falls_back_to_default_speaker_id():
         speaker_vocab,
     )["speaker_id_unique"] == [0]
     assert summarize_rows_mapped_speaker_ids(
+        [{"chunk_owner": 999}],
+        speaker_vocab,
+    )["speaker_id_unique"] == [0]
+
+
+def test_tiny_train_helper_maps_numpy_chunk_owner_to_model_speaker_id():
+    summary = summarize_train_rows_mapped_speaker_ids(
+        [{"chunk_owner": np.int64(1)}],
+        {
+            "default_speaker_id": 0,
+            "db_speaker_id_to_model_speaker_id": {"1": 1},
+        },
+    )
+    assert summary["speaker_id_unique"] == [1]
+
+
+def test_tiny_train_helper_falls_back_to_default_speaker_id():
+    speaker_vocab = {
+        "default_speaker_id": 0,
+        "db_speaker_id_to_model_speaker_id": {"1": 1},
+    }
+    assert summarize_train_rows_mapped_speaker_ids(
+        [{"chunk_owner": None}],
+        speaker_vocab,
+    )["speaker_id_unique"] == [0]
+    assert summarize_train_rows_mapped_speaker_ids(
         [{"chunk_owner": 999}],
         speaker_vocab,
     )["speaker_id_unique"] == [0]
