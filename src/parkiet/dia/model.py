@@ -31,6 +31,33 @@ SPEAKER_MODULE_STATE_KEYS = {
 }
 
 
+def initialize_missing_speaker_modules_neutral(
+    module: torch.nn.Module,
+    missing_keys: list[str],
+) -> None:
+    missing_key_set = set(missing_keys)
+    if "speaker_embedding.weight" in missing_key_set and hasattr(module, "speaker_embedding"):
+        speaker_embedding = getattr(module, "speaker_embedding", None)
+        if speaker_embedding is not None:
+            torch.nn.init.zeros_(speaker_embedding.weight)
+    if "speaker_to_encoder.weight" in missing_key_set and hasattr(module, "speaker_to_encoder"):
+        speaker_to_encoder = getattr(module, "speaker_to_encoder", None)
+        if speaker_to_encoder is not None:
+            torch.nn.init.zeros_(speaker_to_encoder.weight)
+    if "speaker_to_encoder.bias" in missing_key_set and hasattr(module, "speaker_to_encoder"):
+        speaker_to_encoder = getattr(module, "speaker_to_encoder", None)
+        if speaker_to_encoder is not None and speaker_to_encoder.bias is not None:
+            torch.nn.init.zeros_(speaker_to_encoder.bias)
+    if "speaker_to_decoder.weight" in missing_key_set and hasattr(module, "speaker_to_decoder"):
+        speaker_to_decoder = getattr(module, "speaker_to_decoder", None)
+        if speaker_to_decoder is not None:
+            torch.nn.init.zeros_(speaker_to_decoder.weight)
+    if "speaker_to_decoder.bias" in missing_key_set and hasattr(module, "speaker_to_decoder"):
+        speaker_to_decoder = getattr(module, "speaker_to_decoder", None)
+        if speaker_to_decoder is not None and speaker_to_decoder.bias is not None:
+            torch.nn.init.zeros_(speaker_to_decoder.bias)
+
+
 def _get_default_device():
     if torch.cuda.is_available():
         return torch.device("cuda")
@@ -123,6 +150,7 @@ def load_state_dict_allowing_missing_speaker_modules(
                 "Checkpoint is missing non-speaker keys: "
                 f"{disallowed_missing}"
             )
+        initialize_missing_speaker_modules_neutral(module, missing_keys)
 
     return missing_keys, unexpected_keys
 

@@ -10,6 +10,7 @@ from parkiet.dia.config import DecoderConfig, DiaConfig, EncoderConfig
 from parkiet.dia.layers import DiaModel
 from parkiet.dia.model import (
     SPEAKER_MODULE_STATE_KEYS,
+    initialize_missing_speaker_modules_neutral,
     load_state_dict_allowing_missing_speaker_modules,
 )
 from parkiet.speaker_checkpoint import extract_speaker_module_state_dict
@@ -111,6 +112,11 @@ def test_relaxed_loader_allows_only_missing_speaker_module_keys():
             "speaker_to_decoder.bias",
         ]
     )
+    assert torch.count_nonzero(conditioned_model.speaker_embedding.weight).item() == 0
+    assert torch.count_nonzero(conditioned_model.speaker_to_encoder.weight).item() == 0
+    assert torch.count_nonzero(conditioned_model.speaker_to_encoder.bias).item() == 0
+    assert torch.count_nonzero(conditioned_model.speaker_to_decoder.weight).item() == 0
+    assert torch.count_nonzero(conditioned_model.speaker_to_decoder.bias).item() == 0
 
 
 def test_relaxed_loader_rejects_non_speaker_missing_keys():
@@ -132,6 +138,22 @@ def test_relaxed_loader_rejects_non_speaker_missing_keys():
         assert "non-speaker keys" in str(exc)
     else:
         raise AssertionError("Expected RuntimeError for missing non-speaker keys")
+
+
+def test_neutral_speaker_initialization_makes_zero_condition_for_default_speaker():
+    conditioned_config = build_speaker_conditioned_config(
+        _base_config(), _speaker_vocab()
+    )
+    conditioned_model = DiaModel(conditioned_config, torch.float32)
+    initialize_missing_speaker_modules_neutral(
+        conditioned_model,
+        list(SPEAKER_MODULE_STATE_KEYS),
+    )
+    encoder_bias, decoder_bias = conditioned_model.get_speaker_condition(
+        torch.tensor([0], dtype=torch.long)
+    )
+    assert torch.count_nonzero(encoder_bias).item() == 0
+    assert torch.count_nonzero(decoder_bias).item() == 0
 
 
 def test_speaker_vocab_maps_source_speaker_1_to_model_speaker_1(tmp_path: Path):
