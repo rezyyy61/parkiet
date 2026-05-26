@@ -14,6 +14,7 @@ from scripts.create_speaker_conditioned_config import (
     build_speaker_conditioned_config,
     derive_num_speakers,
 )
+from scripts.tiny_speaker_finetune_train import filter_rows_by_duration_ms
 
 
 def _base_config() -> DiaConfig:
@@ -203,3 +204,13 @@ def test_tiny_train_helper_falls_back_to_default_speaker_id():
         [{"chunk_owner": 999}],
         speaker_vocab,
     )["speaker_id_unique"] == [0]
+
+
+def test_tiny_train_duration_filter_keeps_only_short_rows():
+    rows = [
+        {"duration_ms": 1200.0, "chunk_owner": 1},
+        {"duration_ms": 3100.0, "chunk_owner": 1},
+        {"duration_ms": None, "chunk_owner": 1},
+    ]
+    filtered = filter_rows_by_duration_ms(rows, max_duration_ms=2500.0)
+    assert filtered == [{"duration_ms": 1200.0, "chunk_owner": 1}]
