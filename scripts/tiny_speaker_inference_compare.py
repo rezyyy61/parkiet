@@ -8,9 +8,18 @@ from typing import Any
 
 import torch
 
-from parkiet.dia.audio import DEFAULT_SAMPLE_RATE
 from parkiet.dia.config import DiaConfig
 from parkiet.dia.model import Dia, load_state_dict_allowing_missing_speaker_modules
+
+
+DEFAULT_OUTPUT_SAMPLE_RATE = 44100
+
+
+def resolve_output_sample_rate(config: DiaConfig) -> int:
+    sample_rate = getattr(config, "output_sample_rate", None)
+    if sample_rate is None:
+        return DEFAULT_OUTPUT_SAMPLE_RATE
+    return int(sample_rate)
 
 
 def load_dia_with_checkpoint(
@@ -44,6 +53,7 @@ def generate_and_save(
     text: str,
     speaker_id: int,
     output_path: str | Path,
+    sample_rate: int,
 ) -> dict[str, Any]:
     start_time = time.time()
     audio = dia.generate(
@@ -62,7 +72,7 @@ def generate_and_save(
         "wav_created": output_path.exists(),
         "file_size_bytes": output_path.stat().st_size if output_path.exists() else 0,
         "generation_duration_sec": generation_duration_sec,
-        "sample_rate": DEFAULT_SAMPLE_RATE,
+        "sample_rate": int(sample_rate),
         "generate_metadata": metadata,
     }
 
@@ -79,6 +89,10 @@ def run_compare(
     text: str,
 ) -> dict[str, Any]:
     torch.manual_seed(seed)
+    config = DiaConfig.load(str(config_path))
+    if config is None:
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    sample_rate = resolve_output_sample_rate(config)
 
     output_dir_path = Path(output_dir)
     output_dir_path.mkdir(parents=True, exist_ok=True)
@@ -99,18 +113,21 @@ def run_compare(
         text=text,
         speaker_id=default_speaker_id,
         output_path=output_dir_path / "base_speaker_0.wav",
+        sample_rate=sample_rate,
     )
     tiny_speaker_1 = generate_and_save(
         dia=tiny_dia,
         text=text,
         speaker_id=speaker_id,
         output_path=output_dir_path / "tiny_speaker_1.wav",
+        sample_rate=sample_rate,
     )
     tiny_speaker_0 = generate_and_save(
         dia=tiny_dia,
         text=text,
         speaker_id=default_speaker_id,
         output_path=output_dir_path / "tiny_speaker_0.wav",
+        sample_rate=sample_rate,
     )
 
     report = {
@@ -120,7 +137,7 @@ def run_compare(
         "text": text,
         "speaker_id": int(speaker_id),
         "default_speaker_id": int(default_speaker_id),
-        "sample_rate": DEFAULT_SAMPLE_RATE,
+        "sample_rate": int(sample_rate),
         "outputs": {
             "base_speaker_0": base_speaker_0,
             "tiny_speaker_1": tiny_speaker_1,
