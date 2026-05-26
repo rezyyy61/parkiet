@@ -17,6 +17,7 @@ from parkiet.dia.config import DiaConfig
 from parkiet.dia.model import Dia, load_state_dict_allowing_missing_speaker_modules
 from parkiet.dia.state import DecoderInferenceState, EncoderInferenceState
 from parkiet.jax.dataset import create_dataset, discover_parquet_shards
+from parkiet.speaker_checkpoint import extract_speaker_module_state_dict
 from parkiet.speaker_dataset_summary import (
     summarize_parquet_speaker_ids,
     summarize_rows_mapped_speaker_ids,
@@ -155,6 +156,30 @@ def configure_trainable_parameters(
     if not trainable_parameters:
         raise RuntimeError("No trainable parameters selected for tiny speaker training")
     return trainable_parameters
+
+
+def save_training_checkpoints(
+    dia: Dia,
+    output_dir: str | Path,
+) -> dict[str, Any]:
+    output_dir_path = Path(output_dir)
+    output_dir_path.mkdir(parents=True, exist_ok=True)
+
+    full_checkpoint_path = output_dir_path / "checkpoint_tiny_speaker_conditioned.pt"
+    full_state_dict = dia.model.state_dict()
+    torch.save(full_state_dict, full_checkpoint_path)
+
+    speaker_modules_only_path = output_dir_path / "speaker_modules_only.pt"
+    speaker_only_state_dict = extract_speaker_module_state_dict(full_state_dict)
+    torch.save(speaker_only_state_dict, speaker_modules_only_path)
+
+    return {
+        "output_checkpoint_path": str(full_checkpoint_path),
+        "speaker_modules_only_checkpoint_path": str(speaker_modules_only_path),
+        "full_checkpoint_size_bytes": full_checkpoint_path.stat().st_size,
+        "speaker_modules_only_checkpoint_size_bytes": speaker_modules_only_path.stat().st_size,
+        "speaker_modules_only_state_keys": sorted(speaker_only_state_dict.keys()),
+    }
 
 
 def prepare_input_target_pair(
@@ -461,15 +486,17 @@ def run_tiny_train(
     if speaker_id_unique_seen_sorted == [0]:
         raise RuntimeError("speaker_id_unique_seen only contains default speaker_id 0")
 
-    output_checkpoint_path = output_dir_path / "checkpoint_tiny_speaker_conditioned.pt"
-    torch.save(dia.model.state_dict(), output_checkpoint_path)
+    checkpoint_artifacts = save_training_checkpoints(dia, output_dir_path)
 
     report = {
         "config_path": str(config_path),
         "checkpoint_path": str(checkpoint_path),
         "parquet_path": str(parquet_path),
         "speaker_vocab_path": str(speaker_vocab_path),
-        "output_checkpoint_path": str(output_checkpoint_path),
+        "output_checkpoint_path": checkpoint_artifacts["output_checkpoint_path"],
+        "speaker_modules_only_checkpoint_path": checkpoint_artifacts[
+            "speaker_modules_only_checkpoint_path"
+        ],
         "max_steps": int(max_steps),
         "completed_steps": int(completed_steps),
         "batch_size": int(batch_size),
@@ -489,6 +516,15 @@ def run_tiny_train(
         "full_parquet_speaker_id_unique": full_parquet_summary["speaker_id_unique"],
         "initialized_speaker_module_keys": checkpoint_summary[
             "initialized_speaker_module_keys"
+        ],
+        "speaker_modules_only_state_keys": checkpoint_artifacts[
+            "speaker_modules_only_state_keys"
+        ],
+        "speaker_modules_only_checkpoint_size_bytes": checkpoint_artifacts[
+            "speaker_modules_only_checkpoint_size_bytes"
+        ],
+        "full_checkpoint_size_bytes": checkpoint_artifacts[
+            "full_checkpoint_size_bytes"
         ],
         "cuda_memory_allocated_gb_last": cuda_memory_allocated_gb_last,
         "cuda_memory_reserved_gb_last": cuda_memory_reserved_gb_last,

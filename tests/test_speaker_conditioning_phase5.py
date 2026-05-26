@@ -8,13 +8,20 @@ import torch
 
 from parkiet.dia.config import DecoderConfig, DiaConfig, EncoderConfig
 from parkiet.dia.layers import DiaModel
-from parkiet.dia.model import load_state_dict_allowing_missing_speaker_modules
+from parkiet.dia.model import (
+    SPEAKER_MODULE_STATE_KEYS,
+    load_state_dict_allowing_missing_speaker_modules,
+)
+from parkiet.speaker_checkpoint import extract_speaker_module_state_dict
 from parkiet.speaker_dataset_summary import summarize_rows_mapped_speaker_ids
 from scripts.create_speaker_conditioned_config import (
     build_speaker_conditioned_config,
     derive_num_speakers,
 )
-from scripts.tiny_speaker_finetune_train import filter_rows_by_duration_ms
+from scripts.tiny_speaker_finetune_train import (
+    filter_rows_by_duration_ms,
+    save_training_checkpoints,
+)
 
 
 def _base_config() -> DiaConfig:
@@ -214,3 +221,31 @@ def test_tiny_train_duration_filter_keeps_only_short_rows():
     ]
     filtered = filter_rows_by_duration_ms(rows, max_duration_ms=2500.0)
     assert filtered == [{"duration_ms": 1200.0, "chunk_owner": 1}]
+
+
+def test_extract_speaker_module_state_dict_keeps_only_speaker_keys():
+    conditioned_config = build_speaker_conditioned_config(
+        _base_config(),
+        _speaker_vocab(),
+    )
+    conditioned_model = DiaModel(conditioned_config, torch.float32)
+    extracted = extract_speaker_module_state_dict(conditioned_model.state_dict())
+    assert set(extracted.keys()) == SPEAKER_MODULE_STATE_KEYS
+
+
+def test_save_training_checkpoints_writes_speaker_only_state(tmp_path: Path):
+    conditioned_config = build_speaker_conditioned_config(
+        _base_config(),
+        _speaker_vocab(),
+    )
+    conditioned_model = DiaModel(conditioned_config, torch.float32)
+    dia = type("FakeDia", (), {"model": conditioned_model})()
+    artifacts = save_training_checkpoints(dia, tmp_path)
+
+    speaker_only_state = torch.load(
+        artifacts["speaker_modules_only_checkpoint_path"],
+        map_location="cpu",
+    )
+    assert set(speaker_only_state.keys()) == SPEAKER_MODULE_STATE_KEYS
+    assert artifacts["speaker_modules_only_checkpoint_size_bytes"] > 0
+    assert artifacts["full_checkpoint_size_bytes"] > 0
